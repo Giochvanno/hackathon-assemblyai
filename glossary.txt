@@ -1,0 +1,5 @@
+scanf
+printf
+ampersand
+segmentation fault
+scaffold

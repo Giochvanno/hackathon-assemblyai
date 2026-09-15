@@ -1,5 +1,34 @@
+# --- secrets -----------------------------------------------------------------
+# The API key lives here and must never reach the repository. On Render it is
+# set as an environment variable instead.
 .env
+.env.local
+
+# --- environments ------------------------------------------------------------
 .venv/
+venv/
+env/
 __pycache__/
-samples/*.wav
+*.py[cod]
+
+# --- data --------------------------------------------------------------------
+# Recordings and transcripts of other people's lectures: not ours to publish.
+samples/
 transcripts/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+
+# Course memory and cached definitions — machine state, regenerated on use.
+glossary/
+
+# The before/after proof for the demo. Keep the files, keep them out of git:
+# they contain a full lecture transcript.
+evidence/
+
+# --- editors and systems ------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

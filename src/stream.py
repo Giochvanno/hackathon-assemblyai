@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.parse
 import wave
+from pathlib import Path
 
 import websocket  # pip install websocket-client
 
@@ -87,15 +88,26 @@ class LatencyTracker:
 
 
 class Session:
-    def __init__(self, api_key: str, keyterms: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        keyterms: list[str] | None = None,
+        out_dir: str = "transcripts",
+        label: str = "",
+    ) -> None:
         self.api_key = api_key
         self.keyterms = keyterms or []
+        self.out_dir = out_dir
+        self.label = label
         self.latency = LatencyTracker()
         self.audio_q: queue.Queue[bytes | None] = queue.Queue()
         self.ws: websocket.WebSocketApp | None = None
         self.finals: list[str] = []
         self._line_len = 0  # width of the partial currently on screen
         self._last_word_end: float | None = None  # audio-timeline ms, for latency
+        self.connected = threading.Event()  # file feed waits for this
+        self.turns: list[dict] = []  # full record, saved at the end
+        self._pending_words: list[dict] = []
 
     def _overwrite(self, text: str, newline: bool) -> None:
         """
@@ -121,6 +133,7 @@ class Session:
     # --- websocket callbacks -------------------------------------------------
     def on_open(self, ws: websocket.WebSocketApp) -> None:
         print("[session] connected", flush=True)
+        self.connected.set()
         threading.Thread(target=self._pump_audio, args=(ws,), daemon=True).start()
 
     def on_message(self, ws: websocket.WebSocketApp, raw: str) -> None:
@@ -139,6 +152,15 @@ class Session:
             words = msg.get("words") or []
             if words and words[-1].get("end") is not None:
                 self._last_word_end = words[-1]["end"]
+                self._pending_words = [
+                    {
+                        "text": w.get("text"),
+                        "start": w.get("start"),
+                        "end": w.get("end"),
+                        "confidence": w.get("confidence"),
+                    }
+                    for w in words
+                ]
 
             if not text:
                 return
@@ -150,6 +172,17 @@ class Session:
                     if self._last_word_end is not None
                     else None
                 )
+                # Keep everything: per-word confidence is how we will hunt for
+                # glossary candidates later.
+                self.turns.append(
+                    {
+                        "text": text,
+                        "audio_ms": self._last_word_end,
+                        "latency_ms": round(ms) if ms is not None else None,
+                        "words": self._pending_words,
+                    }
+                )
+                self._pending_words = []
                 stamp = f"[{ms:4.0f}ms]" if ms is not None else "[  --ms]"
                 self._overwrite(f"{stamp} {text}", newline=True)
                 self._last_word_end = None
@@ -169,6 +202,41 @@ class Session:
     def on_close(self, ws: websocket.WebSocketApp, code, reason) -> None:
         print(f"\n[session] closed {code} {reason}", flush=True)
         print(f"[latency] {self.latency.report()}", flush=True)
+        self.save()
+
+    def save(self) -> None:
+        """
+        Persist the run. The .txt is for reading, the .json is the raw material
+        for brick 3 — word-level confidence is where glossary candidates hide.
+        """
+        if not self.turns:
+            return
+        out = Path(self.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        name = f"{self.label}-{stamp}" if self.label else stamp
+
+        txt = out / f"{name}.txt"
+        txt.write_text("\n".join(t["text"] for t in self.turns), encoding="utf-8")
+
+        js = out / f"{name}.json"
+        js.write_text(
+            json.dumps(
+                {
+                    "source": self.label,
+                    "keyterms": self.keyterms,
+                    "latency": {
+                        "samples_ms": [round(x) for x in self.latency.samples_ms],
+                        "summary": self.latency.report(),
+                    },
+                    "turns": self.turns,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[saved] {txt}\n[saved] {js}", flush=True)
 
     # --- audio ---------------------------------------------------------------
     def _pump_audio(self, ws: websocket.WebSocketApp) -> None:
@@ -230,12 +298,32 @@ def feed_microphone(session: Session) -> None:
 
 
 def feed_file(session: Session, path: str) -> None:
-    """Replay a 16kHz mono WAV in real time. Same input every run = comparable numbers."""
+    """
+    Replay a 16 kHz mono WAV at real-time speed.
+
+    Paced deliberately: sending the whole file at once would let the server
+    process faster than a human speaks, and the latency numbers would be
+    fiction. Same file in, comparable numbers out.
+    """
     with wave.open(path, "rb") as wav:
-        assert wav.getframerate() == SAMPLE_RATE, "resample to 16kHz mono first"
+        if wav.getframerate() != SAMPLE_RATE or wav.getnchannels() != 1:
+            raise SystemExit(
+                f"need 16kHz mono, got {wav.getframerate()}Hz "
+                f"{wav.getnchannels()}ch — convert with:\n"
+                f"  ffmpeg -i in.mp4 -ar 16000 -ac 1 out.wav"
+            )
+        total_s = wav.getnframes() / SAMPLE_RATE
+        print(f"[file] {path} — {total_s / 60:.1f} min, replaying at 1x", flush=True)
+
+        session.connected.wait(timeout=15)  # don't feed a socket that isn't open
+
+        next_send = time.monotonic()
         while chunk := wav.readframes(FRAME_BYTES // 2):
             session.audio_q.put(chunk)
-            time.sleep(FRAME_MS / 1000)
+            # absolute schedule: sleep(FRAME_MS) alone drifts on long files
+            next_send += FRAME_MS / 1000
+            time.sleep(max(0, next_send - time.monotonic()))
+
     session.audio_q.put(None)
 
 
@@ -243,6 +331,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", help="16kHz mono WAV to replay instead of the mic")
     ap.add_argument("--keyterms", help="comma-separated starting glossary")
+    ap.add_argument("--keyterms-file", help="text file, one term per line")
+    ap.add_argument("--out", default="transcripts", help="where to save results")
     args = ap.parse_args()
 
     # Read .env from the project root if it exists, so the key never lives in code.
@@ -262,15 +352,26 @@ def main() -> None:
         )
 
     terms = [t.strip() for t in args.keyterms.split(",")] if args.keyterms else []
-    session = Session(api_key, terms)
+    if args.keyterms_file:
+        terms += [
+            ln.strip()
+            for ln in Path(args.keyterms_file).read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+
+    label = Path(args.file).stem if args.file else "mic"
+    session = Session(api_key, terms, out_dir=args.out, label=label)
+
+    if terms:
+        print(f"[glossary] {len(terms)} terms loaded", flush=True)
 
     source = threading.Thread(
         target=feed_file if args.file else feed_microphone,
         args=(session, args.file) if args.file else (session,),
         daemon=True,
     )
+    source.start()
 
-    threading.Thread(target=source.start, daemon=True).start()
     try:
         session.run()
     except KeyboardInterrupt:

@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture Lens</title>
+<style>
+  :root {
+    --bg: #16181c; --panel: #1e2126; --line: #2c3037;
+    --ink: #e6e9ee; --dim: #8b939e;
+    --new: #ffc66d; --known: #6dd3c3;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.7 system-ui, sans-serif;
+    display: grid; grid-template-columns: 1fr 280px; height: 100vh;
+  }
+  @media (max-width: 720px) { body { grid-template-columns: 1fr; } aside { display: none; } }
+
+  main { display: flex; flex-direction: column; min-width: 0; }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .spacer { flex: 1; }
+
+  button {
+    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 5px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button[disabled] { opacity: .4; cursor: default; }
+  button.live { border-color: var(--new); color: var(--new); }
+
+  .metric { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .metric b { color: var(--ink); font-weight: 500; }
+
+  #transcript {
+    flex: 1; overflow-y: auto; padding: 24px 20px; font-size: 17px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .turn { transition: opacity .4s; }
+  .turn.partial { color: var(--dim); }
+  /* the one visual beat: everything recedes, the unknown word does not */
+  #transcript.spotlight .turn:not(.holds-new) { opacity: .25; }
+
+  .gloss {
+    display: flex; gap: 10px; align-items: baseline;
+    font-size: 14px; padding: 8px 12px; margin-left: 2px;
+    border-left: 2px solid var(--new); background: var(--panel);
+    border-radius: 0 5px 5px 0; transition: opacity .8s;
+  }
+  .gloss b { color: var(--new); font-family: var(--mono); font-size: 13px; }
+  .gloss span { color: var(--dim); }
+  .gloss.fade { opacity: .35; }
+
+  .term { color: var(--known); }
+  .term.fresh {
+    color: var(--new); font-weight: 600;
+    border-bottom: 2px solid var(--new); padding-bottom: 1px;
+  }
+
+  aside {
+    border-left: 1px solid var(--line); padding: 16px;
+    display: flex; flex-direction: column; gap: 10px; overflow-y: auto;
+  }
+  aside h2 {
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--dim); margin: 0; font-weight: 500;
+  }
+  #glossary { display: flex; flex-direction: column; gap: 4px; }
+  .entry {
+    font-family: var(--mono); font-size: 12px; padding: 4px 8px;
+    border-radius: 4px; background: var(--panel);
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  .entry.just-added { animation: land .6s ease-out; }
+  @keyframes land {
+    from { background: var(--new); color: #16181c; transform: translateX(10px); }
+  }
+  .entry span:last-child { color: var(--dim); }
+
+  #status { padding: 8px 20px; border-top: 1px solid var(--line);
+            font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Lecture Lens</h1>
+      <span class="metric">course <b id="course">c-programming</b></span>
+      <span class="spacer"></span>
+      <span class="metric">latency <b id="lat">—</b></span>
+      <span class="metric">known <b id="count">0</b></span>
+      <button id="go">Start listening</button>
+    </header>
+    <div id="transcript"></div>
+    <div id="status">idle</div>
+  </main>
+  <aside>
+    <h2>Course glossary</h2>
+    <div id="glossary"></div>
+  </aside>
+
+<script>
+const COURSE = "c-programming";
+const SUBJECT = "C programming";   // tells the judge what counts as a term here
+const TARGET_RATE = 16000;          // what the streaming API expects
+const FRAME_MS = 50;
+
+const $ = id => document.getElementById(id);
+const transcript = $("transcript");
+const say = m => $("status").textContent = m;
+
+let ws, audioCtx, node, stream, running = false;
+let streamStart = null, audioMs = 0, latencies = [], framesSent = 0;
+const known = new Set();
+
+/* ---------- audio ----------------------------------------------------------
+   The browser hands us Float32 samples in [-1, 1] at whatever rate the device
+   runs (usually 48000). The API wants signed 16-bit integers at 16000. Two
+   conversions, both done here.
+--------------------------------------------------------------------------- */
+
+// Linear interpolation between neighbouring samples. Taking every third sample
+// would only work at exactly 48k; this handles 44.1k and anything else.
+function resample(input, fromRate, toRate) {
+  if (fromRate === toRate) return input;
+  const ratio = fromRate / toRate;
+  const out = new Float32Array(Math.floor(input.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio;
+    const low = Math.floor(pos);
+    const frac = pos - low;
+    const a = input[low];
+    const b = input[low + 1] ?? a;
+    out[i] = a + (b - a) * frac;      // weighted average of the two neighbours
+  }
+  return out;
+}
+
+// -1.0..1.0 -> -32768..32767. Clamp first: a sample slightly over 1.0 would
+// wrap around to a large negative number and click loudly.
+function toPCM16(floats) {
+  const out = new Int16Array(floats.length);
+  for (let i = 0; i < floats.length; i++) {
+    const s = Math.max(-1, Math.min(1, floats[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+// Runs on the audio thread, so a slow main thread cannot drop frames.
+const WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor('tap', Tap);
+`;
+
+/* ---------- session -------------------------------------------------------- */
+
+async function start() {
+  say("requesting microphone…");
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
+  });
+
+  say("fetching glossary…");
+  const pre = await fetch("/api/keyterms", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ course: COURSE })
+  }).then(r => r.json());
+  pre.keyterms.forEach(t => addEntry(t, "", false));
+  $("count").textContent = pre.known_count;
+
+  say("minting token…");
+  const { token } = await fetch("/api/token?expires_in_seconds=120").then(r => r.json());
+
+  const params = new URLSearchParams({
+    token,
+    speech_model: "universal-3-5-pro",
+    sample_rate: TARGET_RATE,
+    encoding: "pcm_s16le",
+    format_turns: "true"                  // keyterms only apply to formatted turns
+  });
+  if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
+
+  ws = new WebSocket(`wss://streaming.assemblyai.com/v3/ws?${params}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { say("listening"); streamStart = performance.now(); };
+  ws.onerror = e => { console.error("[ws] error", e); say("socket error — see console"); };
+  ws.onclose = e => {
+    // The close frame carries why. Throwing it away turns every failure into
+    // the same useless "closed".
+    console.warn("[ws] closed", { code: e.code, reason: e.reason, clean: e.wasClean });
+    say(`closed (${e.code}${e.reason ? ": " + e.reason : ""}) · ${framesSent} frames sent`);
+    stop();
+  };
+  ws.onmessage = e => handle(JSON.parse(e.data));
+
+  audioCtx = new AudioContext();
+  const blob = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await audioCtx.audioWorklet.addModule(blob);
+  node = new AudioWorkletNode(audioCtx, "tap");
+  node.port.onmessage = ev => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const pcm = toPCM16(resample(ev.data, audioCtx.sampleRate, TARGET_RATE));
+    audioMs += (pcm.length / TARGET_RATE) * 1000;
+    framesSent++;
+    ws.send(pcm.buffer);
+  };
+
+  // The graph only runs if it reaches the destination — a node that leads
+  // nowhere may never be pulled, and then no audio is ever captured. Route it
+  // through a silent gain so we get the frames without hearing ourselves.
+  const mute = audioCtx.createGain();
+  mute.gain.value = 0;
+  audioCtx.createMediaStreamSource(stream).connect(node);
+  node.connect(mute).connect(audioCtx.destination);
+
+  // Chrome starts contexts suspended until a user gesture has resumed them.
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  console.log("[audio] context", audioCtx.state, audioCtx.sampleRate, "Hz");
+
+  running = true;
+  $("go").textContent = "Stop";
+  $("go").classList.add("live");
+}
+
+function stop() {
+  if (!running) return;              // onclose calls stop, stop must not recurse
+  running = false;
+  $("go").textContent = "Start listening";
+  $("go").classList.remove("live");
+
+  // Say goodbye before tearing the audio down, or the socket is already gone.
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "Terminate" }));
+  try { node?.disconnect(); } catch {}
+  try { audioCtx?.close(); } catch {}
+  stream?.getTracks().forEach(t => t.stop());
+}
+
+/* ---------- transcript ----------------------------------------------------- */
+
+let partialEl = null;
+let lastWordEnd = null;
+
+function handle(msg) {
+  if (msg.type !== "Turn") return;
+
+  // Word timings ride on unformatted turns; the formatted final has none.
+  const words = msg.words || [];
+  if (words.length && words.at(-1).end != null) lastWordEnd = words.at(-1).end;
+
+  if (!msg.transcript) return;
+
+  if (msg.end_of_turn) {
+    if (lastWordEnd != null && streamStart != null) {
+      // Same formula as the Python client: wall clock elapsed minus the
+      // position of that word on the audio timeline.
+      const ms = (performance.now() - streamStart) - lastWordEnd;
+      if (ms > 0 && ms < 5000) {
+        latencies.push(ms);
+        latencies.sort((a, b) => a - b);
+        $("lat").textContent = Math.round(latencies[latencies.length >> 1]) + " ms";
+      }
+    }
+    lastWordEnd = null;
+    partialEl?.remove();
+    partialEl = null;
+    finalise(msg.transcript);
+  } else {
+    if (!partialEl) {
+      partialEl = document.createElement("div");
+      partialEl.className = "turn partial";
+      transcript.append(partialEl);
+    }
+    partialEl.textContent = msg.transcript;
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+}
+
+async function finalise(text) {
+  const el = document.createElement("div");
+  el.className = "turn";
+  el.textContent = text;
+  transcript.append(el);
+  transcript.scrollTop = transcript.scrollHeight;
+
+  const res = await fetch("/api/observe", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ course: COURSE, subject: SUBJECT, text })
+  }).then(r => r.json());
+
+  $("count").textContent = res.known_count;
+
+  // new_terms is {term: definition} — the words that survived the judge
+  const fresh = Object.keys(res.new_terms);
+  if (!fresh.length) return;
+
+  markUp(el, fresh);
+  for (const [term, definition] of Object.entries(res.new_terms)) {
+    addEntry(term, definition, true);
+    if (definition) showGloss(el, term, definition);
+  }
+  spotlight(el);
+}
+
+// Rebuild the turn word by word so the new terms can be coloured.
+// Punctuation is kept outside the span: highlighting "malloc." with the full
+// stop inside looks like the stop is part of the term.
+function markUp(el, fresh) {
+  const set = new Set(fresh.map(t => t.toLowerCase().replace(/[.,;:!?()"']/g, "")));
+  const frag = document.createDocumentFragment();
+
+  for (const token of el.textContent.split(/(\s+)/)) {
+    if (/^\s+$/.test(token) || token === "") { frag.append(token); continue; }
+
+    const bare = token.replace(/[.,;:!?()"']/g, "");
+    if (!set.has(bare.toLowerCase())) { frag.append(token); continue; }
+
+    const at = token.indexOf(bare);
+    frag.append(token.slice(0, at));              // leading quote, bracket…
+    const span = document.createElement("span");
+    span.className = "term fresh";
+    span.textContent = bare;
+    frag.append(span);
+    frag.append(token.slice(at + bare.length));   // trailing full stop, comma…
+  }
+
+  el.replaceChildren(frag);
+}
+
+function spotlight(el) {
+  el.classList.add("holds-new");
+  transcript.classList.add("spotlight");
+  setTimeout(() => transcript.classList.remove("spotlight"), 2200);
+}
+
+// The line that appears beside the term while the lecturer is still talking.
+// Deliberately one line: reading a paragraph here costs the next thirty
+// seconds of the lecture, which is what this is supposed to save.
+function showGloss(turnEl, term, definition) {
+  const gloss = document.createElement("div");
+  gloss.className = "gloss";
+  gloss.innerHTML = `<b></b><span></span>`;
+  gloss.querySelector("b").textContent = term;
+  gloss.querySelector("span").textContent = definition;
+  turnEl.after(gloss);
+  setTimeout(() => gloss.classList.add("fade"), 6000);
+}
+
+function addEntry(term, definition, fresh) {
+  const key = term.toLowerCase();
+  if (known.has(key)) return;
+  known.add(key);
+  const row = document.createElement("div");
+  row.className = "entry" + (fresh ? " just-added" : "");
+  row.title = definition || "";
+  row.innerHTML = `<span></span><span>${fresh ? "new" : ""}</span>`;
+  row.firstChild.textContent = term;
+  $("glossary").prepend(row);
+}
+
+$("go").onclick = () => running ? stop() : start().catch(e => say("error: " + e.message));
+</script>
+</body>
+</html>
