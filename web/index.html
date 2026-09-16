@@ -334,6 +334,9 @@ async function start() {
   running = true;
   $("go").textContent = "Stop";
   $("go").classList.add("live");
+
+  clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 1500);
 }
 
 function stop() {
@@ -347,6 +350,14 @@ function stop() {
   try { node?.disconnect(); } catch {}
   try { audioCtx?.close(); } catch {}
   stream?.getTracks().forEach(t => t.stop());
+
+  // The last sentences are still being judged. Keep collecting for a few more
+  // seconds instead of dropping their definitions on the floor — but only this
+  // poller, in case listening starts again in the meantime.
+  const mine = pollTimer;
+  setTimeout(() => {
+    if (pollTimer === mine) { clearInterval(pollTimer); pollTimer = null; }
+  }, 10000);
 }
 
 /* ---------- transcript ----------------------------------------------------- */
@@ -411,19 +422,22 @@ async function finalise(text) {
     return;
   }
 
-  if (res.note) log(`term judging degraded: ${res.note}`, "warn");
-
-  const count = Object.keys(res.new_terms || {}).length;
-  log(`turn judged: ${count} new term${count === 1 ? "" : "s"}, ` +
-      `${res.known_count} known` + (count ? ` — ${Object.keys(res.new_terms).join(", ")}` : ""),
-      count ? "ok" : "");
-
   $("count").textContent = res.known_count;
 
-  // new_terms is {term: definition} — the words that survived the judge
-  const fresh = Object.keys(res.new_terms);
+  // Words nobody has judged yet. Remember which sentence each one came from,
+  // so the definition can be attached to it when the verdict arrives a second
+  // or two later instead of appearing out of context in the sidebar alone.
+  for (const w of res.pending || []) awaiting.set(w.toLowerCase(), el);
+
+  const fresh = Object.keys(res.new_terms || {});
+  const p = (res.pending || []).length;
+  log(`turn: ${fresh.length} known term${fresh.length === 1 ? "" : "s"}, ` +
+      `${p} to judge, ${res.known_count} in course` +
+      (fresh.length ? ` — ${fresh.join(", ")}` : ""), fresh.length ? "ok" : "");
+
   if (!fresh.length) return;
 
+  // Already judged in an earlier lecture: straight to the screen, no waiting.
   markUp(el, fresh);
   for (const [term, definition] of Object.entries(res.new_terms)) {
     addEntry(term, definition, true);
@@ -432,11 +446,58 @@ async function finalise(text) {
   spotlight(el);
 }
 
+/* ---------- late verdicts --------------------------------------------------- */
+
+// term (lowercase) -> the turn element it was spoken in
+const awaiting = new Map();
+let pollTimer = null;
+
+async function poll() {
+  let res;
+  try {
+    const r = await fetch(`/api/updates?course=${encodeURIComponent(COURSE)}`);
+    if (!r.ok) return;
+    res = await r.json();
+  } catch { return; }
+
+  $("count").textContent = res.known_count;
+  if (!res.terms.length) return;
+
+  const named = [];
+  let flash = null;
+
+  for (const { term, definition, note } of res.terms) {
+    if (note) log(`could not define ${term}: ${note}`, "warn");
+    named.push(term);
+    addEntry(term, definition, true);
+
+    const key = term.toLowerCase();
+    const el = awaiting.get(key);
+    awaiting.delete(key);
+    // isConnected: the sentence may have been cleared while we were waiting.
+    if (!el || !el.isConnected) continue;
+
+    markUp(el, [term]);
+    if (definition) showGloss(el, term, definition);
+    flash = el;
+  }
+
+  log(`judged: ${named.join(", ")}` +
+      (res.waiting ? ` (${res.waiting} still queued)` : ""), "ok");
+  if (flash) spotlight(flash);
+}
+
 // Rebuild the turn word by word so the new terms can be coloured.
 // Punctuation is kept outside the span: highlighting "malloc." with the full
 // stop inside looks like the stop is part of the term.
 function markUp(el, fresh) {
-  const set = new Set(fresh.map(t => t.toLowerCase().replace(/[.,;:!?()"']/g, "")));
+  // Terms arrive for the same sentence at different times, and each call
+  // rebuilds the element from its text. Without remembering what was already
+  // highlighted, marking the second term would erase the first.
+  el._terms ??= new Set();
+  for (const t of fresh) el._terms.add(t.toLowerCase().replace(/[.,;:!?()"']/g, ""));
+
+  const set = el._terms;
   const frag = document.createDocumentFragment();
 
   for (const token of el.textContent.split(/(\s+)/)) {

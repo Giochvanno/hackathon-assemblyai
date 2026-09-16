@@ -51,9 +51,12 @@ For each word below, write exactly one line:
     word = short definition
     word = no
 
-Write "no" when the word is ordinary English rather than a technical term,
-identifier or proper noun in this subject. These are ordinary: finish, raise,
-progress, output, enter, error, please, forget.
+Write "no" unless the word is specific to this subject — a technical term, an
+identifier, a function or API name, a proper noun. The test is whether a
+student who has never taken this course would need it explained. If the word
+means the same thing in ordinary conversation, a definition teaches nothing
+and the answer is "no": finish, raise, progress, program, input, output,
+print, enter, error, please, forget.
 
 Definitions must be under {limit} characters — one line a student can read at a
 glance while the lecturer keeps talking.
@@ -86,6 +89,31 @@ class TermJudge:
             json.dumps(self.cache, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+    def cached(self, words: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
+        """
+        Split words by what we already know, without touching the network.
+
+        Three outcomes, not two. "Judged a term", "judged and rejected" and
+        "never asked" need different handling by the caller: the first goes on
+        screen now, the second is dropped from the glossary now, and only the
+        third is worth a call to the model. Answering the first two instantly
+        is what keeps a repeated term from ever waiting again.
+        """
+        defined: dict[str, str] = {}
+        rejected: list[str] = []
+        unknown: list[str] = []
+
+        for w in words:
+            key = w.lower()
+            if key not in self.cache:
+                unknown.append(w)
+            elif self.cache[key]:
+                defined[w] = self.cache[key]
+            else:
+                rejected.append(w)
+
+        return defined, rejected, unknown
 
     # --- the call ------------------------------------------------------------
     def _ask(self, words: list[str]) -> dict[str, str | None]:
