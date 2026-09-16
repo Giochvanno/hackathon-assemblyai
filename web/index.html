@@ -19,7 +19,9 @@
   }
   @media (max-width: 720px) { body { grid-template-columns: 1fr; } aside { display: none; } }
 
-  main { display: flex; flex-direction: column; min-width: 0; }
+  /* min-height:0 on both: a grid item and a flex item both refuse to shrink
+     below their content by default, which pushes the panel below the fold. */
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   header {
     display: flex; align-items: center; gap: 12px;
     padding: 12px 20px; border-bottom: 1px solid var(--line);
@@ -40,7 +42,8 @@
   .metric b { color: var(--ink); font-weight: 500; }
 
   #transcript {
-    flex: 1; overflow-y: auto; padding: 24px 20px; font-size: 17px;
+    flex: 1 1 0; min-height: 0; overflow-y: auto;
+    padding: 24px 20px; font-size: 17px;
     display: flex; flex-direction: column; gap: 14px;
   }
   .turn { transition: opacity .4s; }
@@ -84,8 +87,21 @@
   }
   .entry span:last-child { color: var(--dim); }
 
-  #status { padding: 8px 20px; border-top: 1px solid var(--line);
+  #status { flex: none; padding: 8px 20px; border-top: 1px solid var(--line);
             font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  /* A visible trace of every step. Faults here are invisible otherwise:
+     the socket just closes and the page looks idle. flex:none keeps it from
+     being squeezed to nothing when the transcript grows. */
+  #log {
+    flex: none; border-top: 1px solid var(--line); background: #101216;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+    height: 180px; overflow-y: auto; padding: 8px 20px;
+  }
+  #log div { display: flex; gap: 10px; white-space: pre-wrap; }
+  #log .t { color: #5a626d; flex: none; }
+  #log .ok   { color: var(--known); }
+  #log .warn { color: var(--new); }
+  #log .err  { color: #ff7b72; }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -101,6 +117,7 @@
     </header>
     <div id="transcript"></div>
     <div id="status">idle</div>
+    <div id="log"></div>
   </main>
   <aside>
     <h2>Course glossary</h2>
@@ -117,6 +134,21 @@ const $ = id => document.getElementById(id);
 const transcript = $("transcript");
 const say = m => $("status").textContent = m;
 
+const t0 = performance.now();
+function log(msg, kind = "") {
+  const row = document.createElement("div");
+  const at = document.createElement("span");
+  at.className = "t";
+  at.textContent = `+${((performance.now() - t0) / 1000).toFixed(2)}s`;
+  const body = document.createElement("span");
+  body.className = kind;
+  body.textContent = msg;
+  row.append(at, body);
+  $("log").append(row);
+  $("log").scrollTop = $("log").scrollHeight;
+  console.log(`[lens] ${msg}`);
+}
+
 let ws, audioCtx, node, stream, running = false;
 let streamStart = null, audioMs = 0, latencies = [], framesSent = 0;
 const known = new Set();
@@ -129,19 +161,35 @@ const known = new Set();
 
 // Linear interpolation between neighbouring samples. Taking every third sample
 // would only work at exactly 48k; this handles 44.1k and anything else.
+//
+// The state matters. A block of 128 samples at 48 kHz is 42.67 output samples,
+// and a resampler that rounds that down to 42 on every call throws away 1.5% of
+// the audio. The loss is invisible per block and ruinous in aggregate: the audio
+// timeline falls behind the wall clock by about a second every minute, which is
+// both a pitch shift and a latency measurement that climbs forever. So carry
+// the fractional position, and the last sample, across calls.
+const rs = { pos: 0, tail: 0 };
+
 function resample(input, fromRate, toRate) {
   if (fromRate === toRate) return input;
   const ratio = fromRate / toRate;
-  const out = new Float32Array(Math.floor(input.length / ratio));
-  for (let i = 0; i < out.length; i++) {
-    const pos = i * ratio;
+  const out = [];
+
+  // pos is measured from the start of `input`, and may begin negative — that
+  // means the next output sample falls between the previous block and this one.
+  let pos = rs.pos;
+  while (pos < input.length) {
     const low = Math.floor(pos);
     const frac = pos - low;
-    const a = input[low];
-    const b = input[low + 1] ?? a;
-    out[i] = a + (b - a) * frac;      // weighted average of the two neighbours
+    const a = low < 0 ? rs.tail : input[low];
+    const b = low + 1 < input.length ? input[low + 1] : input[input.length - 1];
+    out.push(a + (b - a) * frac);
+    pos += ratio;
   }
-  return out;
+
+  rs.pos = pos - input.length;          // carry the remainder into the next block
+  rs.tail = input[input.length - 1];
+  return Float32Array.from(out);
 }
 
 // -1.0..1.0 -> -32768..32767. Clamp first: a sample slightly over 1.0 would
@@ -170,21 +218,33 @@ registerProcessor('tap', Tap);
 /* ---------- session -------------------------------------------------------- */
 
 async function start() {
+  $("log").replaceChildren();
+  log(`page on ${location.protocol}//${location.host}`);
+  log(`secure context: ${window.isSecureContext} (microphone needs true)`);
+
   say("requesting microphone…");
+  log("asking for the microphone…");
   stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
   });
+  log(`microphone granted: ${stream.getAudioTracks()[0]?.label || "unnamed"}`, "ok");
 
   say("fetching glossary…");
-  const pre = await fetch("/api/keyterms", {
+  const preRes = await fetch("/api/keyterms", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ course: COURSE })
-  }).then(r => r.json());
+  });
+  if (!preRes.ok) { log(`/api/keyterms ${preRes.status}: ${await preRes.text()}`, "err"); return; }
+  const pre = await preRes.json();
+  log(`glossary: ${pre.known_count} terms known, ${pre.keyterms.length} sent as keyterms`, "ok");
   pre.keyterms.forEach(t => addEntry(t, "", false));
   $("count").textContent = pre.known_count;
 
   say("minting token…");
-  const { token } = await fetch("/api/token?expires_in_seconds=120").then(r => r.json());
+  const tokRes = await fetch("/api/token?expires_in_seconds=120");
+  if (!tokRes.ok) { log(`/api/token ${tokRes.status}: ${await tokRes.text()}`, "err"); return; }
+  const { token } = await tokRes.json();
+  log(`token received, ${token ? token.length : 0} chars`, token ? "ok" : "err");
 
   const params = new URLSearchParams({
     token,
@@ -195,29 +255,59 @@ async function start() {
   });
   if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
 
-  ws = new WebSocket(`wss://streaming.assemblyai.com/v3/ws?${params}`);
+  const url = `wss://streaming.assemblyai.com/v3/ws?${params}`;
+  log(`opening socket, params: ${params.toString().replace(/token=[^&]+/, "token=…")}`);
+
+  ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { say("listening"); streamStart = performance.now(); };
-  ws.onerror = e => { console.error("[ws] error", e); say("socket error — see console"); };
+  ws.onopen = () => { say("listening"); streamStart = performance.now(); log("socket open", "ok"); };
+  ws.onerror = e => { console.error("[ws] error", e); log("socket error", "err"); };
   ws.onclose = e => {
     // The close frame carries why. Throwing it away turns every failure into
     // the same useless "closed".
-    console.warn("[ws] closed", { code: e.code, reason: e.reason, clean: e.wasClean });
-    say(`closed (${e.code}${e.reason ? ": " + e.reason : ""}) · ${framesSent} frames sent`);
+    log(`socket closed — code ${e.code}, reason "${e.reason || "(none)"}", ` +
+        `clean ${e.wasClean}, ${framesSent} frames sent`, e.code === 1000 ? "warn" : "err");
+    if (framesSent === 0) log("no audio ever reached the socket — the graph is not running", "err");
+    say(`closed (${e.code}) · ${framesSent} frames sent`);
     stop();
   };
-  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === "Begin") log(`session ${m.id} accepted`, "ok");
+    if (m.type === "Termination") log(`terminated: ${m.audio_duration_seconds}s of audio`, "warn");
+    if (m.error) log(`server says: ${m.error}`, "err");
+    handle(m);
+  };
 
   audioCtx = new AudioContext();
   const blob = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
   await audioCtx.audioWorklet.addModule(blob);
   node = new AudioWorkletNode(audioCtx, "tap");
+
+  // The worklet fires every 128 samples — about 2.7 ms, and after resampling
+  // roughly 84 bytes. Sending that straight out means ~375 tiny messages a
+  // second, which the server does not expect. Accumulate to one 50 ms frame
+  // (800 samples at 16 kHz) and send that, exactly like the Python client.
+  const FRAME_SAMPLES = (TARGET_RATE * FRAME_MS) / 1000;   // 800
+  let pending = new Int16Array(0);
+
   node.port.onmessage = ev => {
     if (ws?.readyState !== WebSocket.OPEN) return;
-    const pcm = toPCM16(resample(ev.data, audioCtx.sampleRate, TARGET_RATE));
-    audioMs += (pcm.length / TARGET_RATE) * 1000;
-    framesSent++;
-    ws.send(pcm.buffer);
+
+    const chunk = toPCM16(resample(ev.data, audioCtx.sampleRate, TARGET_RATE));
+    const merged = new Int16Array(pending.length + chunk.length);
+    merged.set(pending);
+    merged.set(chunk, pending.length);
+    pending = merged;
+
+    while (pending.length >= FRAME_SAMPLES) {
+      const frame = pending.slice(0, FRAME_SAMPLES);
+      pending = pending.slice(FRAME_SAMPLES);
+      audioMs += FRAME_MS;
+      framesSent++;
+      ws.send(frame.buffer);
+      if (framesSent === 1) log(`first frame sent, ${frame.byteLength} bytes`, "ok");
+    }
   };
 
   // The graph only runs if it reaches the destination — a node that leads
@@ -230,7 +320,16 @@ async function start() {
 
   // Chrome starts contexts suspended until a user gesture has resumed them.
   if (audioCtx.state === "suspended") await audioCtx.resume();
-  console.log("[audio] context", audioCtx.state, audioCtx.sampleRate, "Hz");
+  log(`audio context ${audioCtx.state} at ${audioCtx.sampleRate} Hz`,
+      audioCtx.state === "running" ? "ok" : "err");
+
+  // Watch for a silent worklet — but only once the socket is actually open,
+  // or this fires during the handshake and cries wolf.
+  setTimeout(() => {
+    if (!running) return;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    if (framesSent === 0) log("socket open but no frames — check the worklet", "err");
+  }, 2500);
 
   running = true;
   $("go").textContent = "Stop";
@@ -297,10 +396,27 @@ async function finalise(text) {
   transcript.append(el);
   transcript.scrollTop = transcript.scrollHeight;
 
-  const res = await fetch("/api/observe", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ course: COURSE, subject: SUBJECT, text })
-  }).then(r => r.json());
+  // Failures here were invisible: the transcript kept flowing and the glossary
+  // silently stayed empty.
+  let res;
+  try {
+    const r = await fetch("/api/observe", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ course: COURSE, subject: SUBJECT, text })
+    });
+    if (!r.ok) { log(`/api/observe ${r.status}: ${(await r.text()).slice(0, 200)}`, "err"); return; }
+    res = await r.json();
+  } catch (e) {
+    log(`/api/observe failed: ${e.message}`, "err");
+    return;
+  }
+
+  if (res.note) log(`term judging degraded: ${res.note}`, "warn");
+
+  const count = Object.keys(res.new_terms || {}).length;
+  log(`turn judged: ${count} new term${count === 1 ? "" : "s"}, ` +
+      `${res.known_count} known` + (count ? ` — ${Object.keys(res.new_terms).join(", ")}` : ""),
+      count ? "ok" : "");
 
   $("count").textContent = res.known_count;
 
@@ -372,7 +488,9 @@ function addEntry(term, definition, fresh) {
   $("glossary").prepend(row);
 }
 
-$("go").onclick = () => running ? stop() : start().catch(e => say("error: " + e.message));
+$("go").onclick = () => running
+  ? stop()
+  : start().catch(e => { log(`start failed: ${e.name}: ${e.message}`, "err"); say("error — see log"); });
 </script>
 </body>
 </html>

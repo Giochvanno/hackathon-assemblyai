@@ -100,22 +100,27 @@ def observe(turn: TurnIn) -> dict:
     fresh = g.observe_turn(turn.text)
 
     defined: dict[str, str] = {}
+    note = ""
     if fresh:
         try:
             defined = judge(turn.course, turn.subject).judge(fresh)
+            # Only prune when the judge actually spoke. An unreachable model
+            # returns the same empty result as "none of these are terms", and
+            # acting on that wipes the glossary.
+            for term in fresh:
+                if term not in defined:
+                    g.forget(term)
         except Exception as exc:
-            print(f"[observe] judging unavailable: {exc}")
-            defined = {t: "" for t in fresh}  # degrade to no definitions
-
-        for term in fresh:
-            if term not in defined:
-                g.forget(term)
+            note = str(exc)
+            print(f"[observe] {note}")
+            defined = {t: "" for t in fresh}  # keep the terms, lose the definitions
 
     g.save()
     return {
         "new_terms": defined,
         "known_count": len(g.terms),
         "keyterms": g.keyterms(),
+        "note": note,
     }
 
 
