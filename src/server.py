@@ -38,9 +38,27 @@ from terms import BATCH, TermJudge
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+ROOT = Path(__file__).resolve().parent.parent
+
 API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 TOKEN_URL = "https://streaming.assemblyai.com/v3/token"
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = ROOT / "web"
+
+# Where the course memory lives. Anchored to the project, not to the working
+# directory: locally the server starts in src/ and in production somewhere else
+# entirely, and a relative path would quietly point at a different, empty
+# glossary in each — no error, no terms, no way to tell why. DATA_DIR lets a
+# host mount real storage over it.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT / "glossary")
+
+# A course the project ships with, committed to the repository.
+#
+# Free hosting gives a service a filesystem that is wiped on every restart, and
+# a product whose whole claim is "this course already taught you that word"
+# cannot open with an empty memory. So the first lecture lives in the repository
+# and is copied into place on boot. What the course learns after that survives
+# until the next restart and no longer — an honest limitation, not a hidden one.
+SEED_DIR = ROOT / "seed"
 
 # How often the worker empties the queue. Short enough that a definition still
 # lands while its sentence is on screen, long enough that several turns share
@@ -65,13 +83,13 @@ _lock = threading.Lock()
 
 def glossary_for(name: str) -> CourseGlossary:
     if name not in _courses:
-        _courses[name] = CourseGlossary(name)
+        _courses[name] = CourseGlossary(name, directory=str(DATA_DIR))
     return _courses[name]
 
 
 def judge_for(name: str, subject: str | None = None) -> TermJudge:
     if name not in _judges:
-        _judges[name] = TermJudge(subject or name)
+        _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR))
     return _judges[name]
 
 
@@ -134,8 +152,29 @@ async def worker() -> None:
                 print(f"[worker] {type(exc).__name__}: {exc}")
 
 
+def plant_seed() -> None:
+    """
+    Copy the shipped course memory into place, once, for whatever is not there.
+
+    Never overwrites: a file already in DATA_DIR is what this instance has
+    learned, and it outranks the snapshot in the repository. So this is a floor
+    under the memory, not a reset of it, and it is safe to run on every boot.
+    """
+    if not SEED_DIR.is_dir():
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for src in sorted(SEED_DIR.glob("*.json")):
+        dst = DATA_DIR / src.name
+        if dst.exists():
+            continue
+        dst.write_bytes(src.read_bytes())
+        print(f"[seed] planted {src.name}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    plant_seed()
     task = asyncio.create_task(worker())
     yield
     task.cancel()
