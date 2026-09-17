@@ -16,6 +16,7 @@ seconds, which is exactly what the product is supposed to save.
 Results are cached — a term is judged once per course, ever.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,23 @@ MIN_INTERVAL_S = 1.2
 RETRIES = 3
 BACKOFF_S = 1.5
 
+# Everyday English, by corpus frequency rather than by hand. A hand-written
+# stop list was letting "program", "crash" and "output" through, and no list
+# written by one person at one sitting is ever finished.
+#
+# It marks words, it does not reject them: "class", "stack" and "table" are
+# everyday words AND real terms, and the difference is not how common the word
+# is but whether this subject gives it a second meaning. That question the
+# model can answer — but only if it is asked about the right words, which is
+# what the marking is for.
+EVERYDAY = {
+    w.strip()
+    for w in (Path(__file__).resolve().parent.parent / "data" / "everyday-english.txt")
+    .read_text(encoding="utf-8")
+    .splitlines()
+    if w.strip()
+}
+
 # Line format, not JSON. A small model asked for JSON copies the example's keys
 # verbatim — it answered {"term": "scanf"} instead of {"scanf": "..."} — while
 # judging the words correctly. One word per line, one separator, nothing to
@@ -51,12 +69,14 @@ For each word below, write exactly one line:
     word = short definition
     word = no
 
-Write "no" unless the word is specific to this subject — a technical term, an
-identifier, a function or API name, a proper noun. The test is whether a
-student who has never taken this course would need it explained. If the word
-means the same thing in ordinary conversation, a definition teaches nothing
-and the answer is "no": finish, raise, progress, program, input, output,
-print, enter, error, please, forget.
+Words marked (everyday) are ordinary English. Define one only when this
+subject gives it a different meaning from the one it has outside the lecture
+hall — a class or a stack in programming is not the everyday thing, so those
+get a definition. A program, a crash, an error or an output mean exactly what
+they always mean, so those get "no".
+
+Unmarked words are rare outside this subject. Define them, unless they are
+plainly not technical.
 
 Definitions must be under {limit} characters — one line a student can read at a
 glance while the lecturer keeps talking.
@@ -64,11 +84,24 @@ glance while the lecturer keeps talking.
 Example for a lecture on databases:
 
     rollback = undoes every change made since the transaction began
-    table = no
+    index (everyday) = a lookup structure that makes queries faster
+    problem (everyday) = no
 
 Now do these words. Nothing else, no headings, no numbering:
 
 {words}"""
+
+
+def mark(word: str) -> str:
+    return f"{word} (everyday)" if word.lower() in EVERYDAY else word
+
+
+# Short on purpose: it goes in every cache file and only has to detect change,
+# not prove anything. The model name is in it because the same question put to
+# a different model is a different question.
+PROMPT_FINGERPRINT = hashlib.sha256(
+    (PROMPT + MODEL + str(len(EVERYDAY))).encode()
+).hexdigest()[:12]
 
 
 class TermJudge:
@@ -80,13 +113,29 @@ class TermJudge:
         self._load()
 
     def _load(self) -> None:
-        if self.cache_path.exists():
-            self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        if not self.cache_path.exists():
+            return
+
+        data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        # A cached verdict is never re-asked — that is the whole point of a
+        # cache, and it is also how a change to the prompt goes unnoticed:
+        # every word judged under the old rules keeps its old answer forever.
+        # The fingerprint makes the cache expire with the question that
+        # produced it, so changing PROMPT is a code change and nothing else.
+        if data.get("prompt") != PROMPT_FINGERPRINT:
+            print(f"[terms] prompt changed — re-judging {self.subject} from scratch")
+            return
+        self.cache = data.get("terms", {})
 
     def _save(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.cache_path.write_text(
-            json.dumps(self.cache, ensure_ascii=False, indent=2, sort_keys=True),
+            json.dumps(
+                {"prompt": PROMPT_FINGERPRINT, "terms": self.cache},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
 
@@ -123,7 +172,7 @@ class TermJudge:
         prompt = PROMPT.format(
             subject=self.subject,
             limit=MAX_DEFINITION_CHARS,
-            words="\n".join(words),   # one per line, matching the answer shape
+            words="\n".join(mark(w) for w in words),   # one per line, as the answer
         )
         body = {
             "model": MODEL,
@@ -236,7 +285,9 @@ def parse_reply(content: str, asked: list[str]) -> dict[str, str | None]:
             if sep not in line:
                 continue
             left, right = line.split(sep, 1)
-            key = left.strip().strip("`\"'*").lower().strip(".,;:!?()")
+            key = left.strip().strip("`\"'*").lower()
+            key = re.sub(r"\s*\(.*?\)\s*$", "", key)   # drop our own (everyday) marker
+            key = key.strip(".,;:!?()")
             if key not in wanted:
                 break  # a line about something else; don't try other separators
 

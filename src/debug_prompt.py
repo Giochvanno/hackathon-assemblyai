@@ -16,9 +16,13 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from terms import GATEWAY, MODEL, PROMPT, MAX_DEFINITION_CHARS, parse_reply
+from terms import GATEWAY, MODEL, PROMPT, MAX_DEFINITION_CHARS, mark, parse_reply
 
-WORDS = ["scanf", "printf", "ampersand", "malloc", "segmentation", "forget", "please"]
+# A deliberate mix: rare terms, ordinary words, and the hard middle —
+# "class" and "stack" are everyday words that this subject redefines,
+# "program" and "crash" are everyday words that it does not.
+WORDS = ["scanf", "printf", "malloc", "ampersand", "segmentation",
+         "class", "stack", "program", "crash", "output", "please"]
 
 
 def main() -> None:
@@ -34,7 +38,9 @@ def main() -> None:
         sys.exit("No ASSEMBLYAI_API_KEY")
 
     prompt = PROMPT.format(
-        subject="C programming", limit=MAX_DEFINITION_CHARS, words=", ".join(WORDS)
+        subject="C programming",
+        limit=MAX_DEFINITION_CHARS,
+        words="\n".join(mark(w) for w in WORDS),
     )
 
     print("=" * 70)
