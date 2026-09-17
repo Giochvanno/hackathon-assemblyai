@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# The terminal tools only: stream.py records from a microphone and talks to the
+# socket itself, convert.py needs ffmpeg. Neither runs in production, and
+# sounddevice needs PortAudio installed on the machine — a dependency a web
+# host has no reason to carry.
+sounddevice>=0.4.6
+websocket-client>=1.7.0
+imageio-ffmpeg>=0.4.9
