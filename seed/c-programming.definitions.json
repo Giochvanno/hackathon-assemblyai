@@ -1,0 +1,19 @@
+{
+  "prompt": "0a5ff5382e28",
+  "terms": {
+    "ampersand": "the symbol & used to represent a pointer to a variable",
+    "getchar": "reads the next character from standard input",
+    "header": "a file containing declarations that are included by other files",
+    "input": "data entered by the user or received from a device",
+    "output": "data sent to the screen or file by a program",
+    "pass": null,
+    "printf": "sends formatted data to the standard output stream",
+    "putchar": "writes the specified character to standard output",
+    "scanf": "reads formatted data from the standard input stream",
+    "standard": null,
+    "stdio": "standard input/output library for handling data streams",
+    "stores": null,
+    "value": "the current data held within a variable",
+    "variable": "a named location in memory that holds a data value"
+  }
+}

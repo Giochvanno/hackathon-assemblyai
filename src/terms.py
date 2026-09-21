@@ -105,9 +105,16 @@ PROMPT_FINGERPRINT = hashlib.sha256(
 
 
 class TermJudge:
-    def __init__(self, subject: str, cache_dir: str = "glossary") -> None:
+    def __init__(self, subject: str, cache_dir: str = "glossary",
+                 course: str | None = None) -> None:
         self.subject = subject
-        self.cache_path = Path(cache_dir) / f"{subject}.definitions.json"
+        # Named after the COURSE, not the subject. The subject is prose that
+        # goes into the prompt ("C programming"); the course is the identity
+        # ("c-programming"). Naming the file after the subject put a space in
+        # it and, worse, split one course's cache across two files whenever a
+        # request arrived without a subject — silently, and only after a
+        # restart, which is the hardest kind of bug to see.
+        self.cache_path = Path(cache_dir) / f"{course or subject}.definitions.json"
         self.cache: dict[str, str | None] = {}
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
         self._load()

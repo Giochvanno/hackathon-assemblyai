@@ -89,7 +89,7 @@ def glossary_for(name: str) -> CourseGlossary:
 
 def judge_for(name: str, subject: str | None = None) -> TermJudge:
     if name not in _judges:
-        _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR))
+        _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR), course=name)
     return _judges[name]
 
 
@@ -123,16 +123,27 @@ def flush(name: str) -> None:
             )
         return
 
+    # Three outcomes again, and the middle one is the trap. A word the reply
+    # never mentioned is NOT a rejection — terms.py deliberately leaves it
+    # uncached so it gets asked again — but treating it as one here deleted it
+    # from the course memory anyway, quietly, before it ever got a second
+    # chance. Ask the cache what actually happened instead of inferring it
+    # from an absent key.
+    _, rejected, unjudged = j.cached(words)
+
     out = []
     for w in words:
         if w in defined:
             out.append({"term": w, "definition": defined[w], "note": ""})
-        else:
+        elif w in rejected:
             # Judged and rejected: drop it, or "finish" and "raise" sit in the
             # course memory forever and go out as keyterms. AssemblyAI warns
             # that common words in that list make recognition worse, so the
             # filter is protecting the transcript, not just the sidebar.
             g.forget(w)
+
+    if unjudged:
+        print(f"[flush] no verdict yet for {', '.join(unjudged)} — keeping them")
 
     g.save()
     with _lock:

@@ -1,0 +1,60 @@
+{
+  "course": "c-programming",
+  "terms": {
+    "ampersand": {
+      "count": 2,
+      "first_seen": "2026-09-21",
+      "surface": "ampersand"
+    },
+    "getchar": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "getchar"
+    },
+    "header": {
+      "count": 2,
+      "first_seen": "2026-09-21",
+      "surface": "header"
+    },
+    "input": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "input"
+    },
+    "output": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "output"
+    },
+    "printf": {
+      "count": 2,
+      "first_seen": "2026-09-21",
+      "surface": "printf"
+    },
+    "putchar": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "putchar"
+    },
+    "scanf": {
+      "count": 5,
+      "first_seen": "2026-09-21",
+      "surface": "scanf"
+    },
+    "stdio": {
+      "count": 2,
+      "first_seen": "2026-09-21",
+      "surface": "stdio"
+    },
+    "value": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "value"
+    },
+    "variable": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "variable"
+    }
+  }
+}
