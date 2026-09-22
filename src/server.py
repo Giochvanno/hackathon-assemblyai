@@ -24,6 +24,7 @@ screen.
 import asyncio
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+import lost
 from glossary import CourseGlossary
 from terms import BATCH, TermJudge
 
@@ -75,10 +77,24 @@ _judges: dict[str, TermJudge] = {}
 _pending: dict[str, dict[str, None]] = {}
 _resolved: dict[str, list[dict]] = {}
 
+# Every term this run has introduced, with the moment it happened. The glossary
+# knows THAT a term is known; this knows WHEN the student first met it, which
+# is the only way to answer "what landed on me in the last three minutes".
+# Kept in memory on purpose: it describes one sitting, not the course.
+_introduced: dict[str, list[dict]] = {}
+
 # Requests run in FastAPI's threadpool and the worker runs in its own thread;
 # both read and write the structures above. One lock for all of them is enough
 # at this scale and leaves no room for a half-applied update.
 _lock = threading.Lock()
+
+
+def record_introduction(course: str, term: str, definition: str) -> None:
+    """Note that the student has just met this term for the first time."""
+    with _lock:
+        _introduced.setdefault(course, []).append(
+            {"term": term, "definition": definition, "at": time.monotonic()}
+        )
 
 
 def glossary_for(name: str) -> CourseGlossary:
@@ -135,6 +151,7 @@ def flush(name: str) -> None:
     for w in words:
         if w in defined:
             out.append({"term": w, "definition": defined[w], "note": ""})
+            record_introduction(name, w, defined[w])
         elif w in rejected:
             # Judged and rejected: drop it, or "finish" and "raise" sit in the
             # course memory forever and go out as keyterms. AssemblyAI warns
@@ -205,6 +222,15 @@ class TermsIn(BaseModel):
     course: str = "default"
 
 
+class LostIn(BaseModel):
+    course: str = "default"
+    subject: str | None = None
+    # The tail of the transcript, oldest first. The browser keeps it; this
+    # server never stores a lecture, which is somebody else's speech.
+    turns: list[str] = []
+    window_s: float = 180.0
+
+
 @app.get("/api/token")
 def token(expires_in_seconds: int = 120) -> dict:
     """
@@ -245,6 +271,9 @@ def observe(turn: TurnIn) -> dict:
     fresh = g.observe_turn(turn.text)
     defined, rejected, unknown = j.cached(fresh)
 
+    for w in defined:
+        record_introduction(turn.course, w, defined[w])
+
     for w in rejected:
         g.forget(w)
 
@@ -283,6 +312,65 @@ def updates(course: str = "default") -> dict:
         "known_count": len(g.terms),
         "keyterms": g.keyterms(),
     }
+
+
+@app.post("/api/lost")
+def im_lost(body: LostIn) -> dict:
+    """
+    The student pressed the button. Answer why, not what.
+
+    The terms come from this server's own record of what the student has met
+    for the first time; the words come from the browser, which is the only
+    place a lecture is ever held. So the two halves of the answer are assembled
+    from two different memories, and neither of them is a stored transcript.
+    """
+    now = time.monotonic()
+    with _lock:
+        events = list(_introduced.get(body.course, []))
+
+    window = [e for e in events if now - e["at"] <= body.window_s]
+    minutes = body.window_s / 60.0
+
+    density = {
+        "in_window": len(window),
+        "per_minute": round(len(window) / minutes, 2) if minutes else 0.0,
+        "session_per_minute": None,
+    }
+    # A rate is meaningless without something to compare it to. The lecture's
+    # own average so far is the fairest baseline we have: it needs no extra
+    # data and it adapts to how fast this particular lecturer introduces
+    # things. Below half a minute of material it says nothing, so we say so.
+    if events:
+        span_min = (now - events[0]["at"]) / 60.0
+        if span_min >= 0.5:
+            density["session_per_minute"] = round(len(events) / span_min, 2)
+
+    if not window:
+        return {
+            "terms": [],
+            "why": "",
+            "density": density,
+            "note": "no new terms in this stretch — the gap is probably earlier",
+        }
+
+    terms = [{"term": e["term"], "definition": e["definition"]} for e in window]
+
+    try:
+        why = lost.explain(
+            subject=body.subject or body.course,
+            turns=body.turns,
+            terms=terms,
+            minutes=minutes,
+            api_key=API_KEY,
+        )
+        note = ""
+    except Exception as exc:
+        # The list of terms is the finding; the paragraph is the polish. Losing
+        # the second is no reason to withhold the first.
+        print(f"[lost] {exc}")
+        why, note = "", str(exc)
+
+    return {"terms": terms, "why": why, "density": density, "note": note}
 
 
 @app.post("/api/keyterms")

@@ -104,6 +104,61 @@ PROMPT_FINGERPRINT = hashlib.sha256(
 ).hexdigest()[:12]
 
 
+def ask_gateway(prompt: str, api_key: str | None, max_tokens: int = 900) -> str:
+    """
+    One question to the LLM Gateway, with the pacing that keeps it answering.
+
+    Module-level rather than a method because the rate limit belongs to the
+    ACCOUNT, not to any one judge or course. Two callers spacing their own
+    requests independently would still trip it together, which is how we
+    collected 429s the first time.
+    """
+    if not api_key:
+        raise RuntimeError("ASSEMBLYAI_API_KEY is not set")
+
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+
+    last: Exception | None = None
+    for attempt in range(RETRIES):
+        # Keep our own calls apart before the gateway has to push back.
+        gap = time.monotonic() - _last_call["at"]
+        if gap < MIN_INTERVAL_S:
+            time.sleep(MIN_INTERVAL_S - gap)
+
+        try:
+            r = requests.post(
+                GATEWAY,
+                headers={"authorization": api_key, "content-type": "application/json"},
+                json=body,
+                timeout=30,
+            )
+            _last_call["at"] = time.monotonic()
+
+            if r.status_code == 429:
+                # Honour the server's own advice when it gives any.
+                wait = float(r.headers.get("retry-after") or BACKOFF_S * (attempt + 1))
+                print(f"[terms] rate limited, waiting {wait:.1f}s")
+                time.sleep(wait)
+                last = RuntimeError("rate limited")
+                continue
+
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+        except requests.RequestException as exc:
+            _last_call["at"] = time.monotonic()
+            last = exc
+            if attempt < RETRIES - 1:
+                time.sleep(BACKOFF_S * (attempt + 1))
+
+    raise last or RuntimeError("gateway did not answer")
+
+
 class TermJudge:
     def __init__(self, subject: str, cache_dir: str = "glossary",
                  course: str | None = None) -> None:
@@ -173,58 +228,12 @@ class TermJudge:
 
     # --- the call ------------------------------------------------------------
     def _ask(self, words: list[str]) -> dict[str, str | None]:
-        if not self.api_key:
-            raise RuntimeError("ASSEMBLYAI_API_KEY is not set")
-
         prompt = PROMPT.format(
             subject=self.subject,
             limit=MAX_DEFINITION_CHARS,
             words="\n".join(mark(w) for w in words),   # one per line, as the answer
         )
-        body = {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 900,
-            "temperature": 0,
-        }
-
-        last: Exception | None = None
-        for attempt in range(RETRIES):
-            # Keep our own calls apart before the gateway has to push back.
-            gap = time.monotonic() - _last_call["at"]
-            if gap < MIN_INTERVAL_S:
-                time.sleep(MIN_INTERVAL_S - gap)
-
-            try:
-                r = requests.post(
-                    GATEWAY,
-                    headers={
-                        "authorization": self.api_key,
-                        "content-type": "application/json",
-                    },
-                    json=body,
-                    timeout=30,
-                )
-                _last_call["at"] = time.monotonic()
-
-                if r.status_code == 429:
-                    # Honour the server's own advice when it gives any.
-                    wait = float(r.headers.get("retry-after") or BACKOFF_S * (attempt + 1))
-                    print(f"[terms] rate limited, waiting {wait:.1f}s")
-                    time.sleep(wait)
-                    last = RuntimeError("rate limited")
-                    continue
-
-                r.raise_for_status()
-                return parse_reply(r.json()["choices"][0]["message"]["content"], words)
-
-            except requests.RequestException as exc:
-                _last_call["at"] = time.monotonic()
-                last = exc
-                if attempt < RETRIES - 1:
-                    time.sleep(BACKOFF_S * (attempt + 1))
-
-        raise last or RuntimeError("gateway did not answer")
+        return parse_reply(ask_gateway(prompt, self.api_key), words)
 
     def judge(self, words: list[str]) -> dict[str, str]:
         """

@@ -102,6 +102,39 @@
   #log .ok   { color: var(--known); }
   #log .warn { color: var(--new); }
   #log .err  { color: #ff7b72; }
+
+  /* --- "I'm lost" ---------------------------------------------------------
+     A panel, not a dialog. A dialog would take the lecture away from the
+     student for as long as it is open, and the lecturer does not stop. */
+  button.lost { border-color: #4a3f52; color: #cdb4db; }
+  button.lost:hover { border-color: #cdb4db; }
+  button.lost.busy { opacity: .6; cursor: progress; }
+
+  #why {
+    flex: none; display: none; gap: 12px; flex-direction: column;
+    border-top: 1px solid var(--line); background: var(--panel);
+    padding: 14px 20px; max-height: 40vh; overflow-y: auto;
+    animation: rise .25s ease-out;
+  }
+  #why.open { display: flex; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+
+  #why header { padding: 0; border: 0; gap: 10px; }
+  #why h2 {
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: #cdb4db; margin: 0; font-weight: 500;
+  }
+  #why-rate { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+  #why-text { font-size: 15px; line-height: 1.65; margin: 0; }
+  #why-terms { display: flex; flex-wrap: wrap; gap: 6px; }
+  #why-terms .chip {
+    font-family: var(--mono); font-size: 12px; padding: 3px 9px;
+    border-radius: 999px; background: #16181c; border: 1px solid var(--line);
+    color: var(--new);
+  }
+  #why .close {
+    border: 0; background: none; color: var(--dim); padding: 0 4px; font-size: 18px;
+  }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -113,9 +146,20 @@
       <span class="spacer"></span>
       <span class="metric">latency <b id="lat">—</b></span>
       <span class="metric">known <b id="count">0</b></span>
+      <button id="lost" class="lost" title="Explain why this got hard to follow">I'm lost</button>
       <button id="go">Start listening</button>
     </header>
     <div id="transcript"></div>
+    <section id="why">
+      <header>
+        <h2>Why this got hard</h2>
+        <span id="why-rate" class="metric"></span>
+        <span class="spacer"></span>
+        <button class="close" id="why-close" title="Close">&times;</button>
+      </header>
+      <div id="why-terms"></div>
+      <p id="why-text"></p>
+    </section>
     <div id="status">idle</div>
     <div id="log"></div>
   </main>
@@ -215,7 +259,33 @@ class Tap extends AudioWorkletProcessor {
 registerProcessor('tap', Tap);
 `;
 
-/* ---------- session -------------------------------------------------------- */
+/* ---------- session --------------------------------------------------------
+   A lecture is fifty minutes and a websocket is not. Wi-Fi drops, a laptop
+   sleeps for a moment, the server hiccups. The first version answered all of
+   those by stopping, which costs the student the rest of the lecture — the one
+   thing this is supposed to prevent. So the socket is disposable and the audio
+   graph is not: a drop replaces the socket and leaves the microphone alone.
+--------------------------------------------------------------------------- */
+
+// Doubling, then a ceiling. Five attempts over half a minute is long enough to
+// ride out a lift or a router reboot, and short enough that a genuinely dead
+// connection is reported rather than retried at forever.
+const RETRY_MS = [1000, 2000, 4000, 8000, 15000];
+
+// How long a socket must hold before we call it recovered. Without this, a
+// link that opens and dies two seconds later resets the attempt counter every
+// time, and "five attempts" becomes an infinite loop at one-second intervals
+// — each one minting a token. Opening is not recovering; staying open is.
+const STABLE_MS = 10000;
+
+let retry = 0;
+let openedAt = 0;
+let retryTimer = null;
+let stopping = false;          // a close the user asked for is not a failure
+let framesTotal = 0;
+let pending16 = new Int16Array(0);
+
+const FRAME_SAMPLES = (TARGET_RATE * FRAME_MS) / 1000;   // 800
 
 async function start() {
   $("log").replaceChildren();
@@ -229,56 +299,9 @@ async function start() {
   });
   log(`microphone granted: ${stream.getAudioTracks()[0]?.label || "unnamed"}`, "ok");
 
-  say("fetching glossary…");
-  const preRes = await fetch("/api/keyterms", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ course: COURSE })
-  });
-  if (!preRes.ok) { log(`/api/keyterms ${preRes.status}: ${await preRes.text()}`, "err"); return; }
-  const pre = await preRes.json();
-  log(`glossary: ${pre.known_count} terms known, ${pre.keyterms.length} sent as keyterms`, "ok");
-  pre.keyterms.forEach(t => addEntry(t, "", false));
-  $("count").textContent = pre.known_count;
-
-  say("minting token…");
-  const tokRes = await fetch("/api/token?expires_in_seconds=120");
-  if (!tokRes.ok) { log(`/api/token ${tokRes.status}: ${await tokRes.text()}`, "err"); return; }
-  const { token } = await tokRes.json();
-  log(`token received, ${token ? token.length : 0} chars`, token ? "ok" : "err");
-
-  const params = new URLSearchParams({
-    token,
-    speech_model: "universal-3-5-pro",
-    sample_rate: TARGET_RATE,
-    encoding: "pcm_s16le",
-    format_turns: "true"                  // keyterms only apply to formatted turns
-  });
-  if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
-
-  const url = `wss://streaming.assemblyai.com/v3/ws?${params}`;
-  log(`opening socket, params: ${params.toString().replace(/token=[^&]+/, "token=…")}`);
-
-  ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => { say("listening"); streamStart = performance.now(); log("socket open", "ok"); };
-  ws.onerror = e => { console.error("[ws] error", e); log("socket error", "err"); };
-  ws.onclose = e => {
-    // The close frame carries why. Throwing it away turns every failure into
-    // the same useless "closed".
-    log(`socket closed — code ${e.code}, reason "${e.reason || "(none)"}", ` +
-        `clean ${e.wasClean}, ${framesSent} frames sent`, e.code === 1000 ? "warn" : "err");
-    if (framesSent === 0) log("no audio ever reached the socket — the graph is not running", "err");
-    say(`closed (${e.code}) · ${framesSent} frames sent`);
-    stop();
-  };
-  ws.onmessage = e => {
-    const m = JSON.parse(e.data);
-    if (m.type === "Begin") log(`session ${m.id} accepted`, "ok");
-    if (m.type === "Termination") log(`terminated: ${m.audio_duration_seconds}s of audio`, "warn");
-    if (m.error) log(`server says: ${m.error}`, "err");
-    handle(m);
-  };
-
+  // The graph is built once and outlives every socket. Tearing it down on a
+  // drop would mean asking for the microphone again, and the browser may well
+  // put up another permission prompt in the middle of the lecture.
   audioCtx = new AudioContext();
   const blob = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
   await audioCtx.audioWorklet.addModule(blob);
@@ -288,25 +311,23 @@ async function start() {
   // roughly 84 bytes. Sending that straight out means ~375 tiny messages a
   // second, which the server does not expect. Accumulate to one 50 ms frame
   // (800 samples at 16 kHz) and send that, exactly like the Python client.
-  const FRAME_SAMPLES = (TARGET_RATE * FRAME_MS) / 1000;   // 800
-  let pending = new Int16Array(0);
-
   node.port.onmessage = ev => {
-    if (ws?.readyState !== WebSocket.OPEN) return;
+    if (ws?.readyState !== WebSocket.OPEN) return;   // between sockets: drop it
 
     const chunk = toPCM16(resample(ev.data, audioCtx.sampleRate, TARGET_RATE));
-    const merged = new Int16Array(pending.length + chunk.length);
-    merged.set(pending);
-    merged.set(chunk, pending.length);
-    pending = merged;
+    const merged = new Int16Array(pending16.length + chunk.length);
+    merged.set(pending16);
+    merged.set(chunk, pending16.length);
+    pending16 = merged;
 
-    while (pending.length >= FRAME_SAMPLES) {
-      const frame = pending.slice(0, FRAME_SAMPLES);
-      pending = pending.slice(FRAME_SAMPLES);
+    while (pending16.length >= FRAME_SAMPLES) {
+      const frame = pending16.slice(0, FRAME_SAMPLES);
+      pending16 = pending16.slice(FRAME_SAMPLES);
       audioMs += FRAME_MS;
       framesSent++;
+      framesTotal++;
       ws.send(frame.buffer);
-      if (framesSent === 1) log(`first frame sent, ${frame.byteLength} bytes`, "ok");
+      if (framesTotal === 1) log(`first frame sent, ${frame.byteLength} bytes`, "ok");
     }
   };
 
@@ -323,25 +344,136 @@ async function start() {
   log(`audio context ${audioCtx.state} at ${audioCtx.sampleRate} Hz`,
       audioCtx.state === "running" ? "ok" : "err");
 
-  // Watch for a silent worklet — but only once the socket is actually open,
-  // or this fires during the handshake and cries wolf.
-  setTimeout(() => {
-    if (!running) return;
-    if (ws?.readyState !== WebSocket.OPEN) return;
-    if (framesSent === 0) log("socket open but no frames — check the worklet", "err");
-  }, 2500);
-
   running = true;
+  stopping = false;
+  retry = 0;
   $("go").textContent = "Stop";
   $("go").classList.add("live");
 
   clearInterval(pollTimer);
   pollTimer = setInterval(poll, 1500);
+
+  await openSocket();
+
+  // Watch for a silent worklet — but only once the socket is actually open,
+  // or this fires during the handshake and cries wolf.
+  setTimeout(() => {
+    if (!running || ws?.readyState !== WebSocket.OPEN) return;
+    if (framesTotal === 0) log("socket open but no frames — check the worklet", "err");
+  }, 2500);
+}
+
+async function openSocket() {
+  // Keyterms are fetched again, not remembered. The course has been learning
+  // for the whole lecture, so a socket opened at minute forty starts with a
+  // better vocabulary than the one opened at minute zero.
+  say(retry ? "reconnecting…" : "fetching glossary…");
+  const preRes = await fetch("/api/keyterms", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ course: COURSE })
+  });
+  if (!preRes.ok) throw new Error(`/api/keyterms ${preRes.status}`);
+  const pre = await preRes.json();
+  log(`glossary: ${pre.known_count} terms known, ${pre.keyterms.length} sent as keyterms`, "ok");
+  pre.keyterms.forEach(t => addEntry(t, "", false));
+  $("count").textContent = pre.known_count;
+
+  // A fresh token every time: they are single-use and expire in two minutes,
+  // so the one that opened the first socket is no good for the second.
+  const tokRes = await fetch("/api/token?expires_in_seconds=120");
+  if (!tokRes.ok) throw new Error(`/api/token ${tokRes.status}`);
+  const { token } = await tokRes.json();
+  log(`token received, ${token ? token.length : 0} chars`, token ? "ok" : "err");
+
+  const params = new URLSearchParams({
+    token,
+    speech_model: "universal-3-5-pro",
+    sample_rate: TARGET_RATE,
+    encoding: "pcm_s16le",
+    format_turns: "true"                  // keyterms only apply to formatted turns
+  });
+  if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
+
+  const url = `wss://streaming.assemblyai.com/v3/ws?${params}`;
+  log(`opening socket, params: ${params.toString().replace(/token=[^&]+/, "token=…")}`);
+
+  framesSent = 0;
+  openedAt = 0;
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    say("listening");
+    // Each socket is its own audio timeline: word.end counts from ITS start,
+    // so latency measured against the old origin would climb by however long
+    // the gap was and never come back.
+    streamStart = performance.now();
+    lastWordEnd = null;
+    openedAt = performance.now();
+    if (retry) log(`reconnected after ${retry} attempt(s)`, "ok");
+    log("socket open", "ok");
+  };
+
+  ws.onerror = e => { console.error("[ws] error", e); log("socket error", "err"); };
+
+  ws.onclose = e => {
+    // The close frame carries why. Throwing it away turns every failure into
+    // the same useless "closed".
+    log(`socket closed — code ${e.code}, reason "${e.reason || "(none)"}", ` +
+        `clean ${e.wasClean}, ${framesSent} frames on this socket`,
+        e.code === 1000 ? "warn" : "err");
+    if (framesTotal === 0) log("no audio ever reached the socket — the graph is not running", "err");
+
+    if (stopping || !running) { say(`closed (${e.code}) · ${framesTotal} frames sent`); stop(); return; }
+
+    // Earned a clean slate only by holding the line, not by answering the phone.
+    if (openedAt && performance.now() - openedAt >= STABLE_MS) {
+      log(`that connection held for ${Math.round((performance.now() - openedAt) / 1000)}s`);
+      retry = 0;
+    }
+    reconnect();
+  };
+
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === "Begin") log(`session ${m.id} accepted`, "ok");
+    if (m.type === "Termination") log(`terminated: ${m.audio_duration_seconds}s of audio`, "warn");
+    if (m.error) log(`server says: ${m.error}`, "err");
+    handle(m);
+  };
+}
+
+function reconnect() {
+  if (retry >= RETRY_MS.length) {
+    log(`gave up after ${retry} attempts — the connection is not coming back`, "err");
+    say("disconnected");
+    stop();
+    return;
+  }
+
+  const wait = RETRY_MS[retry++];
+  // Whatever was half-collected belongs to a session that no longer exists.
+  // Sending it into the next one would splice two timelines together.
+  pending16 = new Int16Array(0);
+
+  say(`reconnecting in ${Math.round(wait / 1000)}s…`);
+  log(`waiting ${wait} ms before attempt ${retry}`, "warn");
+
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    if (!running) return;
+    openSocket().catch(err => {
+      log(`reconnect attempt ${retry} failed: ${err.message}`, "err");
+      reconnect();
+    });
+  }, wait);
 }
 
 function stop() {
   if (!running) return;              // onclose calls stop, stop must not recurse
   running = false;
+  stopping = true;
+  clearTimeout(retryTimer);
   $("go").textContent = "Start listening";
   $("go").classList.remove("live");
 
@@ -400,7 +532,15 @@ function handle(msg) {
   }
 }
 
+// What was said recently, with when. The server keeps no transcript — a
+// lecture is somebody else's speech — so the words for "I'm lost" have to
+// come from here, and only the ones still inside the window.
+const WINDOW_S = 180;
+const spoken = [];
+
 async function finalise(text) {
+  spoken.push({ text, at: performance.now() });
+
   const el = document.createElement("div");
   el.className = "turn";
   el.textContent = text;
@@ -548,6 +688,74 @@ function addEntry(term, definition, fresh) {
   row.firstChild.textContent = term;
   $("glossary").prepend(row);
 }
+
+/* ---------- "I'm lost" ------------------------------------------------------
+   The button does not ask for a summary. The student heard the passage; what
+   they lost is the thread between the terms that just landed on them, and the
+   only place that is known is the course memory on the server. */
+
+const lostBtn = $("lost");
+
+async function askWhy() {
+  if (lostBtn.classList.contains("busy")) return;
+  lostBtn.classList.add("busy");
+  lostBtn.textContent = "thinking…";
+
+  const cutoff = performance.now() - WINDOW_S * 1000;
+  const turns = spoken.filter(t => t.at >= cutoff).map(t => t.text);
+
+  let res;
+  try {
+    const r = await fetch("/api/lost", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ course: COURSE, subject: SUBJECT, turns, window_s: WINDOW_S })
+    });
+    if (!r.ok) { log(`/api/lost ${r.status}: ${(await r.text()).slice(0, 200)}`, "err"); return; }
+    res = await r.json();
+  } catch (e) {
+    log(`/api/lost failed: ${e.message}`, "err");
+    return;
+  } finally {
+    lostBtn.classList.remove("busy");
+    lostBtn.textContent = "I'm lost";
+  }
+
+  showWhy(res);
+}
+
+function showWhy(res) {
+  const terms = res.terms || [];
+  const d = res.density || {};
+
+  $("why-terms").replaceChildren(...terms.map(t => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = t.term;
+    chip.title = t.definition || "";
+    return chip;
+  }));
+
+  // The rate on its own means nothing; against the lecture's own average it
+  // says whether this really was a burst or just felt like one.
+  const mins = Math.round(WINDOW_S / 60);
+  let rate = `${d.in_window} new in ${mins} min · ${d.per_minute}/min`;
+  if (d.session_per_minute != null) {
+    rate += ` · lecture average ${d.session_per_minute}/min`;
+  }
+  $("why-rate").textContent = rate;
+
+  $("why-text").textContent =
+    res.why ||
+    res.note ||
+    "No explanation came back, but the terms above are what landed on you.";
+
+  $("why").classList.add("open");
+  log(`lost: ${terms.length} new term(s) in the last ${mins} min` +
+      (res.note ? ` — ${res.note}` : ""), terms.length ? "warn" : "");
+}
+
+lostBtn.onclick = askWhy;
+$("why-close").onclick = () => $("why").classList.remove("open");
 
 $("go").onclick = () => running
   ? stop()

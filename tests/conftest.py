@@ -84,11 +84,38 @@ def srv(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server, "DATA_DIR", tmp_path / "glossary")
     monkeypatch.setattr(server, "SEED_DIR", tmp_path / "seed")
-    for store in (server._courses, server._judges, server._pending, server._resolved):
+    for store in (server._courses, server._judges, server._pending,
+                  server._resolved, server._introduced):
         store.clear()
 
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
     yield server
 
-    for store in (server._courses, server._judges, server._pending, server._resolved):
+    for store in (server._courses, server._judges, server._pending,
+                  server._resolved, server._introduced):
         store.clear()
+
+@pytest.fixture
+def explainer(monkeypatch):
+    """
+    Stands in for the model behind the "I'm lost" button.
+
+    lost.py binds ask_gateway at import time, so the patch goes on lost's own
+    name. Patching terms.ask_gateway would leave lost still holding the real
+    one — quietly, and only in this one place.
+    """
+    import lost
+
+    def install(reply="Here is the thread.", fails=False):
+        calls = []
+
+        def fake(prompt, api_key, max_tokens=900):
+            calls.append(prompt)
+            if fails:
+                raise RuntimeError("gateway did not answer")
+            return reply
+
+        monkeypatch.setattr(lost, "ask_gateway", fake)
+        return calls
+
+    return install
