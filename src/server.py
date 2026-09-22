@@ -23,6 +23,7 @@ screen.
 
 import asyncio
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -62,6 +63,20 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT / "glossary")
 # until the next restart and no longer — an honest limitation, not a hidden one.
 SEED_DIR = ROOT / "seed"
 
+# A course name becomes a filename. Anything else is refused rather than
+# sanitised: silently rewriting "../../etc/passwd" into something harmless
+# hides the fact that somebody tried, and a typo in a real course name would
+# quietly open a second, empty course instead of saying so.
+COURSE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# How many flushes a word gets before we stop asking about it. Without a
+# ceiling an unreachable gateway retries the same twenty words every two
+# seconds for the rest of the lecture.
+MAX_ATTEMPTS = 3
+
+# The longest stretch /api/lost will ever be asked about.
+MAX_WINDOW_S = 1800.0
+
 # How often the worker empties the queue. Short enough that a definition still
 # lands while its sentence is on screen, long enough that several turns share
 # one call instead of each buying its own rate-limit penalty.
@@ -83,33 +98,75 @@ _resolved: dict[str, list[dict]] = {}
 # Kept in memory on purpose: it describes one sitting, not the course.
 _introduced: dict[str, list[dict]] = {}
 
+# How many times each queued word has been asked about, so a failure can be
+# retried without becoming a loop.
+_attempts: dict[str, dict[str, int]] = {}
+
 # Requests run in FastAPI's threadpool and the worker runs in its own thread;
 # both read and write the structures above. One lock for all of them is enough
 # at this scale and leaves no room for a half-applied update.
-_lock = threading.Lock()
+# Reentrant: helpers that take it call each other, and a plain Lock turns
+# one careless nesting into a hang with no error and no traceback.
+_lock = threading.RLock()
+
+
+def valid_course(name: str) -> str:
+    if not COURSE_RE.match(name or ""):
+        raise HTTPException(400, "course must be letters, digits, dot, dash or underscore")
+    return name
 
 
 def record_introduction(course: str, term: str, definition: str) -> None:
     """Note that the student has just met this term for the first time."""
     with _lock:
-        _introduced.setdefault(course, []).append(
-            {"term": term, "definition": definition, "at": time.monotonic()}
-        )
+        log = _introduced.setdefault(course, [])
+        log.append({"term": term, "definition": definition, "at": time.monotonic()})
+        # Only a recent window is ever read, and the whole list is copied on
+        # every press of the button. Drop what can no longer be asked about.
+        cutoff = time.monotonic() - MAX_WINDOW_S
+        if len(log) > 64 and log[0]["at"] < cutoff:
+            _introduced[course] = [e for e in log if e["at"] >= cutoff]
 
 
 def glossary_for(name: str) -> CourseGlossary:
-    if name not in _courses:
-        _courses[name] = CourseGlossary(name, directory=str(DATA_DIR))
-    return _courses[name]
+    # Check-then-act under the lock. Unguarded, a request and the worker can
+    # both see "not present", both build one, and then hold SEPARATE memories
+    # of the same course while writing the same file — so whichever saves last
+    # erases what the other learned. Only in the first seconds of a lecture,
+    # which is the hardest window to ever reproduce.
+    with _lock:
+        if name not in _courses:
+            _courses[name] = CourseGlossary(name, directory=str(DATA_DIR))
+        return _courses[name]
 
 
 def judge_for(name: str, subject: str | None = None) -> TermJudge:
-    if name not in _judges:
-        _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR), course=name)
-    return _judges[name]
+    with _lock:
+        if name not in _judges:
+            _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR),
+                                      course=name)
+        return _judges[name]
 
 
 # --- the background worker ---------------------------------------------------
+
+def requeue(name: str, word: str) -> bool:
+    """
+    Put a word back in the queue for one more try. Caller holds _lock.
+
+    Returns False once the word has used up its attempts. Dropping a word
+    after three tries is deliberate: an unreachable gateway would otherwise
+    have the worker asking about the same twenty words every two seconds for
+    the rest of the lecture, and never getting to the ones spoken since.
+    """
+    tries = _attempts.setdefault(name, {})
+    tries[word] = tries.get(word, 0) + 1
+    if tries[word] >= MAX_ATTEMPTS:
+        tries.pop(word, None)
+        return False
+    _pending.setdefault(name, {})[word] = None
+    return True
+
 
 def flush(name: str) -> None:
     """
@@ -129,14 +186,19 @@ def flush(name: str) -> None:
     try:
         defined = j.judge(words)
     except Exception as exc:
-        # The model could not be reached. Show the words undefined rather than
-        # dropping them: "we could not explain this" is still worth more to the
-        # student than silence, and the term stays in the course memory.
+        # The model could not be reached. Put the words back — a thirty-second
+        # network blip used to cost the lecture every term spoken during it,
+        # permanently, because a word already in the course memory never
+        # appears as "first time" again and so is never re-queued by itself.
         print(f"[flush] {exc}")
         with _lock:
-            _resolved.setdefault(name, []).extend(
-                {"term": w, "definition": "", "note": str(exc)} for w in words
-            )
+            spent = [w for w in words if not requeue(name, w)]
+            if spent:
+                # Out of tries. Show them undefined rather than in silence: the
+                # term still belongs to the lecture, it just has no line yet.
+                _resolved.setdefault(name, []).extend(
+                    {"term": w, "definition": "", "note": str(exc)} for w in spent
+                )
         return
 
     # Three outcomes again, and the middle one is the trap. A word the reply
@@ -159,13 +221,24 @@ def flush(name: str) -> None:
             # filter is protecting the transcript, not just the sidebar.
             g.forget(w)
 
-    if unjudged:
-        print(f"[flush] no verdict yet for {', '.join(unjudged)} — keeping them")
-
-    g.save()
     with _lock:
+        # Hand over the verdicts BEFORE touching the disk. They have already
+        # been paid for with a gateway call, and a file that would not write is
+        # no reason for the student never to see them.
         if out:
             _resolved.setdefault(name, []).extend(out)
+        for w in defined:
+            _attempts.get(name, {}).pop(w, None)
+        for w in unjudged:
+            if requeue(name, w):
+                print(f"[flush] no verdict for {w!r} — asking again")
+            else:
+                print(f"[flush] gave up on {w!r} after {MAX_ATTEMPTS} attempts")
+
+    try:
+        g.save()
+    except Exception as exc:
+        print(f"[flush] could not save {name}: {exc}")
 
 
 async def worker() -> None:
@@ -265,6 +338,7 @@ def observe(turn: TurnIn) -> dict:
 
     Nothing here touches the network, so the answer is as fast as the disk.
     """
+    valid_course(turn.course)
     g = glossary_for(turn.course)
     j = judge_for(turn.course, turn.subject)
 
@@ -302,6 +376,7 @@ def updates(course: str = "default") -> dict:
     is handed over exactly once, so the browser never has to work out which of
     them it has already drawn.
     """
+    valid_course(course)
     g = glossary_for(course)
     with _lock:
         terms = _resolved.pop(course, [])
@@ -324,12 +399,14 @@ def im_lost(body: LostIn) -> dict:
     place a lecture is ever held. So the two halves of the answer are assembled
     from two different memories, and neither of them is a stored transcript.
     """
+    valid_course(body.course)
     now = time.monotonic()
+    window_s = max(10.0, min(MAX_WINDOW_S, body.window_s))
     with _lock:
         events = list(_introduced.get(body.course, []))
 
-    window = [e for e in events if now - e["at"] <= body.window_s]
-    minutes = body.window_s / 60.0
+    window = [e for e in events if now - e["at"] <= window_s]
+    minutes = window_s / 60.0
 
     density = {
         "in_window": len(window),
@@ -376,6 +453,7 @@ def im_lost(body: LostIn) -> dict:
 @app.post("/api/keyterms")
 def keyterms(body: TermsIn) -> dict:
     """What the course already knows — sent to the socket as it opens."""
+    valid_course(body.course)
     g = glossary_for(body.course)
     return {"keyterms": g.keyterms(), "known_count": len(g.terms)}
 

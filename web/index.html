@@ -179,6 +179,17 @@ const transcript = $("transcript");
 const say = m => $("status").textContent = m;
 
 const t0 = performance.now();
+const LOG_LINES = 300;          // what fits a problem, not a lecture
+const TRANSCRIPT_TURNS = 150;   // roughly the last fifteen minutes on screen
+
+// Only follow the speaker if the reader is already at the bottom. Scrolling
+// back to re-read the sentence that contained the unknown word is the whole
+// point of having a transcript, and an unconditional jump makes it impossible.
+function keepUp(el, near = 120) {
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < near;
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
 function log(msg, kind = "") {
   const row = document.createElement("div");
   const at = document.createElement("span");
@@ -189,7 +200,11 @@ function log(msg, kind = "") {
   body.textContent = msg;
   row.append(at, body);
   $("log").append(row);
-  $("log").scrollTop = $("log").scrollHeight;
+  // Fifty minutes of diagnostics is tens of thousands of nodes, and each new
+  // line reads scrollHeight, which forces a layout of the whole column.
+  const panel = $("log");
+  while (panel.childElementCount > LOG_LINES) panel.firstElementChild.remove();
+  panel.scrollTop = panel.scrollHeight;
   console.log(`[lens] ${msg}`);
 }
 
@@ -347,13 +362,28 @@ async function start() {
   running = true;
   stopping = false;
   retry = 0;
+  // Leftovers from the previous session: half a frame of the morning lecture,
+  // and a resampler still interpolating against its last sample.
+  pending16 = new Int16Array(0);
+  rs.pos = 0; rs.tail = 0;
+  framesTotal = 0;
   $("go").textContent = "Stop";
   $("go").classList.add("live");
 
   clearInterval(pollTimer);
   pollTimer = setInterval(poll, 1500);
 
-  await openSocket();
+  try {
+    await openSocket();
+  } catch (e) {
+    // Everything above already said "live": the button is orange, the
+    // microphone is hot, the poller is running. Without this the student
+    // watches a listening-looking page produce nothing for fifty minutes.
+    log(`could not open the session: ${e.message}`, "err");
+    say("could not connect — press Start to try again");
+    stop();
+    return;
+  }
 
   // Watch for a silent worklet — but only once the socket is actually open,
   // or this fires during the handshake and cries wolf.
@@ -367,6 +397,10 @@ async function openSocket() {
   // Keyterms are fetched again, not remembered. The course has been learning
   // for the whole lecture, so a socket opened at minute forty starts with a
   // better vocabulary than the one opened at minute zero.
+  // Two awaits follow, and the student may press Stop during either. Without
+  // these checks openSocket carries on and installs a socket into a session
+  // that no longer exists.
+  if (!running) return;
   say(retry ? "reconnecting…" : "fetching glossary…");
   const preRes = await fetch("/api/keyterms", {
     method: "POST", headers: { "content-type": "application/json" },
@@ -377,6 +411,8 @@ async function openSocket() {
   log(`glossary: ${pre.known_count} terms known, ${pre.keyterms.length} sent as keyterms`, "ok");
   pre.keyterms.forEach(t => addEntry(t, "", false));
   $("count").textContent = pre.known_count;
+
+  if (!running) return;
 
   // A fresh token every time: they are single-use and expire in two minutes,
   // so the one that opened the first socket is no good for the second.
@@ -394,15 +430,23 @@ async function openSocket() {
   });
   if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
 
+  if (!running) return;
+
   const url = `wss://streaming.assemblyai.com/v3/ws?${params}`;
   log(`opening socket, params: ${params.toString().replace(/token=[^&]+/, "token=…")}`);
 
   framesSent = 0;
   openedAt = 0;
-  ws = new WebSocket(url);
+  const sock = new WebSocket(url);
+  ws = sock;
   ws.binaryType = "arraybuffer";
 
+  // Every handler checks it is still the current socket first. An orphan —
+  // one replaced while its handshake was still running — used to fire onclose
+  // with `running` true, which scheduled a reconnect that then replaced the
+  // healthy socket. A dead connection tearing down a live one.
   ws.onopen = () => {
+    if (sock !== ws) { try { sock.close(); } catch {} return; }
     say("listening");
     // Each socket is its own audio timeline: word.end counts from ITS start,
     // so latency measured against the old origin would climb by however long
@@ -414,9 +458,13 @@ async function openSocket() {
     log("socket open", "ok");
   };
 
-  ws.onerror = e => { console.error("[ws] error", e); log("socket error", "err"); };
+  ws.onerror = e => {
+    if (sock !== ws) return;
+    console.error("[ws] error", e); log("socket error", "err");
+  };
 
   ws.onclose = e => {
+    if (sock !== ws) return;
     // The close frame carries why. Throwing it away turns every failure into
     // the same useless "closed".
     log(`socket closed — code ${e.code}, reason "${e.reason || "(none)"}", ` +
@@ -435,7 +483,9 @@ async function openSocket() {
   };
 
   ws.onmessage = e => {
-    const m = JSON.parse(e.data);
+    if (sock !== ws) return;
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
     if (m.type === "Begin") log(`session ${m.id} accepted`, "ok");
     if (m.type === "Termination") log(`terminated: ${m.audio_duration_seconds}s of audio`, "warn");
     if (m.error) log(`server says: ${m.error}`, "err");
@@ -461,6 +511,7 @@ function reconnect() {
 
   clearTimeout(retryTimer);
   retryTimer = setTimeout(() => {
+    retryTimer = null;
     if (!running) return;
     openSocket().catch(err => {
       log(`reconnect attempt ${retry} failed: ${err.message}`, "err");
@@ -473,12 +524,29 @@ function stop() {
   if (!running) return;              // onclose calls stop, stop must not recurse
   running = false;
   stopping = true;
+  // The status line was counting down to a reconnect that is not going to
+  // happen now. Leaving it there tells the student the page is still trying.
+  const wasReconnecting = retryTimer !== null;
   clearTimeout(retryTimer);
+  retryTimer = null;
+  if (wasReconnecting) say("stopped");
   $("go").textContent = "Start listening";
   $("go").classList.remove("live");
 
   // Say goodbye before tearing the audio down, or the socket is already gone.
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "Terminate" }));
+  // Then close it. Sending Terminate is a request; only close() is a promise,
+  // and a socket still mid-handshake never heard the request at all — it used
+  // to finish connecting after Stop and announce "listening" to a dead page.
+  try {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "Terminate" }));
+    ws?.close();
+  } catch {}
+  // NOT ws = null. A real socket fires onclose on a later tick, and the
+  // identity guard there would then see ws === null, decide the event belongs
+  // to somebody else, and skip the closing diagnostic — the one line that says
+  // how many frames the session actually sent. The guard is there to ignore a
+  // socket that was REPLACED, not one that was closed. Nothing sends into it
+  // either way: the frame path already checks readyState.
   try { node?.disconnect(); } catch {}
   try { audioCtx?.close(); } catch {}
   stream?.getTracks().forEach(t => t.stop());
@@ -513,6 +581,7 @@ function handle(msg) {
       const ms = (performance.now() - streamStart) - lastWordEnd;
       if (ms > 0 && ms < 5000) {
         latencies.push(ms);
+        if (latencies.length > 600) latencies.shift();
         latencies.sort((a, b) => a - b);
         $("lat").textContent = Math.round(latencies[latencies.length >> 1]) + " ms";
       }
@@ -528,7 +597,7 @@ function handle(msg) {
       transcript.append(partialEl);
     }
     partialEl.textContent = msg.transcript;
-    transcript.scrollTop = transcript.scrollHeight;
+    keepUp(transcript);
   }
 }
 
@@ -538,14 +607,26 @@ function handle(msg) {
 const WINDOW_S = 180;
 const spoken = [];
 
+// Turns fall off the top once they are far behind the speaker. Their glosses
+// go with them: a gloss without its sentence explains nothing.
+function trimTranscript() {
+  while (transcript.childElementCount > TRANSCRIPT_TURNS) {
+    transcript.firstElementChild.remove();
+  }
+}
+
 async function finalise(text) {
   spoken.push({ text, at: performance.now() });
+  // Only the last window is ever sent; the rest is fifty minutes of strings.
+  const cutoff = performance.now() - WINDOW_S * 1000;
+  while (spoken.length && spoken[0].at < cutoff) spoken.shift();
 
   const el = document.createElement("div");
   el.className = "turn";
   el.textContent = text;
   transcript.append(el);
-  transcript.scrollTop = transcript.scrollHeight;
+  trimTranscript();
+  keepUp(transcript);
 
   // Failures here were invisible: the transcript kept flowing and the glossary
   // silently stayed empty.
@@ -567,7 +648,7 @@ async function finalise(text) {
   // Words nobody has judged yet. Remember which sentence each one came from,
   // so the definition can be attached to it when the verdict arrives a second
   // or two later instead of appearing out of context in the sidebar alone.
-  for (const w of res.pending || []) awaiting.set(w.toLowerCase(), el);
+  for (const w of res.pending || []) awaiting.set(w.toLowerCase(), { el, at: performance.now() });
 
   const fresh = Object.keys(res.new_terms || {});
   const p = (res.pending || []).length;
@@ -588,20 +669,50 @@ async function finalise(text) {
 
 /* ---------- late verdicts --------------------------------------------------- */
 
-// term (lowercase) -> the turn element it was spoken in
+// term (lowercase) -> { el, at }: the sentence a pending word was spoken in.
+//
+// Entries are removed when the verdict arrives — but a word the judge rejects,
+// or gives up on, never gets one. Left alone the map grows all lecture and
+// holds a strong reference to every turn it ever touched, so none of the
+// transcript can be reclaimed. Anything older than the grace period is no
+// longer going to be answered.
 const awaiting = new Map();
+const AWAIT_GRACE_MS = 90000;
 let pollTimer = null;
 
+function pruneAwaiting() {
+  const cutoff = performance.now() - AWAIT_GRACE_MS;
+  for (const [term, entry] of awaiting) {
+    if (entry.at < cutoff) awaiting.delete(term);
+  }
+}
+
+let polling = false;
+
 async function poll() {
+  // A slow server used to have seven of these in flight at once, resolving out
+  // of order — and each one writes the known-terms counter, so it jumped
+  // backwards. One at a time; a missed tick costs 1.5 seconds.
+  if (polling) return;
+  polling = true;
+
   let res;
   try {
     const r = await fetch(`/api/updates?course=${encodeURIComponent(COURSE)}`);
     if (!r.ok) return;
     res = await r.json();
-  } catch { return; }
+  } catch {
+    return;
+  } finally {
+    polling = false;
+  }
 
-  $("count").textContent = res.known_count;
-  if (!res.terms.length) return;
+  // A 200 is not a promise about shape. Reading known_count blindly wrote the
+  // string "undefined" into the header, and res.terms.length then threw inside
+  // the interval, where nothing reports it.
+  if (typeof res?.known_count === "number") $("count").textContent = res.known_count;
+  pruneAwaiting();
+  if (!Array.isArray(res?.terms) || !res.terms.length) return;
 
   const named = [];
   let flash = null;
@@ -612,7 +723,7 @@ async function poll() {
     addEntry(term, definition, true);
 
     const key = term.toLowerCase();
-    const el = awaiting.get(key);
+    const el = awaiting.get(key)?.el;
     awaiting.delete(key);
     // isConnected: the sentence may have been cleared while we were waiting.
     if (!el || !el.isConnected) continue;
@@ -724,8 +835,9 @@ async function askWhy() {
 }
 
 function showWhy(res) {
-  const terms = res.terms || [];
+  const terms = Array.isArray(res.terms) ? res.terms : [];
   const d = res.density || {};
+  const num = v => (typeof v === "number" ? v : "—");
 
   $("why-terms").replaceChildren(...terms.map(t => {
     const chip = document.createElement("span");
@@ -738,7 +850,7 @@ function showWhy(res) {
   // The rate on its own means nothing; against the lecture's own average it
   // says whether this really was a burst or just felt like one.
   const mins = Math.round(WINDOW_S / 60);
-  let rate = `${d.in_window} new in ${mins} min · ${d.per_minute}/min`;
+  let rate = `${num(d.in_window)} new in ${mins} min · ${num(d.per_minute)}/min`;
   if (d.session_per_minute != null) {
     rate += ` · lecture average ${d.session_per_minute}/min`;
   }

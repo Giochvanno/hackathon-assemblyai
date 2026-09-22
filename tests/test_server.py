@@ -8,6 +8,7 @@ request put the last definition of a 35-second test 36 seconds behind the
 speaker — which is the exact failure the product exists to prevent.
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -139,11 +140,12 @@ def test_each_verdict_is_handed_over_exactly_once(srv, model):
     assert second["terms"] == []
 
 
-def test_an_unreachable_model_keeps_the_terms_and_says_so(srv, model):
+def test_a_blip_costs_a_retry_not_the_term(srv, model):
     """
-    Losing the definition is a bad minute. Losing the term is a lost lecture,
-    and the first version of this wiped the glossary whenever the gateway
-    hiccupped.
+    A word already in the course memory never comes back as "first time", so
+    nothing re-queues it by itself. Dropping it on one failed call meant a
+    thirty-second network blip permanently blanked every term spoken during
+    it. So a failure puts the batch back.
     """
     model(fails=True)
     with client(srv) as c:
@@ -152,9 +154,44 @@ def test_an_unreachable_model_keeps_the_terms_and_says_so(srv, model):
 
         body = c.get("/api/updates", params={"course": "c"}).json()
 
-    assert srv.glossary_for("c").is_new("malloc") is False
+    assert srv.glossary_for("c").is_new("malloc") is False, "the term survives"
+    assert body["terms"] == [], "nothing is reported yet — it will be asked again"
+    assert "malloc" in srv._pending["c"], "and it is back in the queue"
+
+
+def test_the_retry_gives_up_rather_than_looping_all_lecture(srv, model):
+    """
+    An unreachable gateway would otherwise have the worker asking about the
+    same twenty words every two seconds until the lecture ends, never reaching
+    the ones spoken since.
+    """
+    fake = model(fails=True)
+    with client(srv) as c:
+        observe(c, "we call malloc here")
+        for _ in range(srv.MAX_ATTEMPTS + 2):
+            srv.flush("c")
+
+        body = c.get("/api/updates", params={"course": "c"}).json()
+
+    assert len(fake.asked) == srv.MAX_ATTEMPTS
+    assert "malloc" not in srv._pending.get("c", {})
     assert body["terms"][0]["term"] == "malloc"
-    assert body["terms"][0]["note"], "the browser should be told why there is no definition"
+    assert body["terms"][0]["note"], "the browser is told why there is no definition"
+    assert srv.glossary_for("c").is_new("malloc") is False, "the term still survives"
+
+
+def test_a_word_with_no_verdict_is_asked_again(srv, model):
+    """
+    The reply omitted it. terms.py leaves it unjudged on purpose; the queue has
+    to be the thing that brings it back, because the glossary never will.
+    """
+    model(omits=["putchar"])
+    with client(srv) as c:
+        observe(c, "the stdio header gives you putchar")
+        srv.flush("c")
+
+    assert "putchar" in srv._pending["c"]
+    assert srv.glossary_for("c").is_new("putchar") is False
 
 
 # --- the shipped course ------------------------------------------------------
@@ -257,3 +294,31 @@ def test_each_course_is_judged_in_its_own_subject(srv, model):
 
     assert srv.judge_for("c").subject == "C programming"
     assert srv.judge_for("algorithms").subject == "Data structures"
+
+# --- a course name is a filename ---------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "../../etc/passwd", "a/b", "..", "", "x" * 200, "has space", "nul\x00byte",
+])
+def test_a_course_name_that_is_not_a_filename_is_refused(srv, name):
+    """
+    The name goes straight into a path, and /api/observe writes a file on every
+    single turn. Refused rather than sanitised: quietly rewriting the name
+    would open a second, empty course and say nothing.
+    """
+    r = TestClient(srv.app).post("/api/observe", json={"course": name, "text": "malloc"})
+    assert r.status_code == 400
+
+
+def test_ordinary_course_names_still_work(srv, model):
+    model()
+    for name in ["c-programming", "CSE305", "algorithms_2", "intro.to.ai"]:
+        r = TestClient(srv.app).post("/api/observe", json={"course": name, "text": "malloc"})
+        assert r.status_code == 200, name
+
+
+def test_an_absurd_window_is_clamped_rather_than_honoured(srv, explainer):
+    explainer()
+    r = TestClient(srv.app).post("/api/lost",
+                                 json={"course": "c", "window_s": 10 ** 9}).json()
+    assert r["density"]["per_minute"] == 0.0     # no terms, and no division blow-up

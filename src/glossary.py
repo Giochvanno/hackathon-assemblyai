@@ -15,7 +15,9 @@ Stored as one JSON file per course, so the memory survives between lectures.
 """
 
 import json
+import os
 import re
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -50,26 +52,56 @@ class CourseGlossary:
         self.course = course
         self.path = Path(directory) / f"{course}.json"
         self.terms: dict[str, dict] = {}
+        # A request thread and the judging worker both reach this object. Without
+        # a lock, json.dumps iterating self.terms while the other thread inserts
+        # a word raises "dictionary changed size during iteration" — which, on
+        # the worker path, discards a batch of definitions already paid for.
+        # Reentrant because observe_turn calls observe, and save reads terms.
+        self._guard = threading.RLock()
         self.load()
 
     # --- persistence ---------------------------------------------------------
     def load(self) -> None:
         if not self.path.exists():
             return
-        data = json.loads(self.path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # A half-written file used to raise here, out of the constructor,
+            # out of every endpoint for this course, forever. One bad shutdown
+            # would have taken the course down permanently. Step aside instead:
+            # the damaged file is kept for inspection, the course starts from
+            # the seed, and the lecture goes on.
+            broken = self.path.with_suffix(".json.broken")
+            print(f"[glossary] {self.path.name} is unreadable ({exc}); moved to {broken.name}")
+            try:
+                os.replace(self.path, broken)
+            except OSError:
+                pass
+            return
         self.terms = data.get("terms", {})
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
+        """
+        Write the memory out, atomically.
+
+        write_text truncates the file and then streams into it, so two threads
+        saving at once — the request on every turn, the worker on every flush —
+        leave a file that is neither version and parses as neither. Serialise
+        under the lock, then swap the finished file into place in one step, so
+        a reader only ever sees a whole file.
+        """
+        with self._guard:
+            body = json.dumps(
                 {"course": self.course, "terms": self.terms},
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+            )
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(f".json.{os.getpid()}.tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, self.path)
 
     # --- the core question ---------------------------------------------------
     def is_new(self, word: str) -> bool:
@@ -82,20 +114,21 @@ class CourseGlossary:
             return False
 
         key = stem(raw)
-        entry = self.terms.get(key)
-        if entry is None:
-            self.terms[key] = {
-                "surface": raw,
-                "count": 1,
-                "first_seen": date.today().isoformat(),
-            }
-            return True
+        with self._guard:
+            entry = self.terms.get(key)
+            if entry is None:
+                self.terms[key] = {
+                    "surface": raw,
+                    "count": 1,
+                    "first_seen": date.today().isoformat(),
+                }
+                return True
 
-        entry["count"] += 1
-        # keep the lowercase form: a leading capital is usually sentence start
-        if entry["surface"][:1].isupper() and not raw[:1].isupper():
-            entry["surface"] = raw
-        return False
+            entry["count"] += 1
+            # keep the lowercase form: a leading capital is usually sentence start
+            if entry["surface"][:1].isupper() and not raw[:1].isupper():
+                entry["surface"] = raw
+            return False
 
     def forget(self, word: str) -> None:
         """
@@ -106,7 +139,8 @@ class CourseGlossary:
         one that turned out to be ordinary. Without it the course memory fills
         with noise and that noise goes out as keyterms.
         """
-        self.terms.pop(stem(word.strip(".,;:!?()\"'")), None)
+        with self._guard:
+            self.terms.pop(stem(word.strip(".,;:!?()\"'")), None)
 
     def observe_turn(self, text: str) -> list[str]:
         """Feed a finished turn. Returns the terms met for the first time."""
@@ -125,9 +159,10 @@ class CourseGlossary:
         once are left out — one appearance is as likely to be a mishearing as
         a real term.
         """
-        settled = [
-            (k, v) for k, v in self.terms.items() if v["count"] >= 2 and len(k) <= 50
-        ]
+        with self._guard:
+            settled = [
+                (k, v) for k, v in self.terms.items() if v["count"] >= 2 and len(k) <= 50
+            ]
         settled.sort(key=lambda kv: -kv[1]["count"])
         return [v["surface"] for _, v in settled[:limit]]
 

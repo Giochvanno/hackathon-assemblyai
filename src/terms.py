@@ -20,13 +20,25 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
 import requests
 
 # Shared across every course: the rate limit is per account, not per glossary.
+# Guarded, because the pacing is a check-then-sleep and there are now two kinds
+# of caller — the judging worker and the "I'm lost" button on a request thread.
+# Unguarded, both read the same stale timestamp, both decide the gap is wide
+# enough, and both fire in the same millisecond: the 429 storm this exists to
+# prevent.
 _last_call = {"at": 0.0}
+_pace = threading.Lock()
+
+# Some servers answer 429 with an hour. Sleeping that long on a request thread
+# is indistinguishable from a hang, so we cap it and let the retry budget run
+# out instead.
+MAX_RETRY_AFTER_S = 30.0
 
 GATEWAY = "https://llm-gateway.assemblyai.com/v1/chat/completions"
 MODEL = "qwen3.5-4b-32k-fast"   # fast and cheap; swap for a larger one if needed
@@ -125,10 +137,13 @@ def ask_gateway(prompt: str, api_key: str | None, max_tokens: int = 900) -> str:
 
     last: Exception | None = None
     for attempt in range(RETRIES):
-        # Keep our own calls apart before the gateway has to push back.
-        gap = time.monotonic() - _last_call["at"]
-        if gap < MIN_INTERVAL_S:
-            time.sleep(MIN_INTERVAL_S - gap)
+        # Claim the slot and sleep while holding it, so the next caller waits
+        # for us rather than racing us.
+        with _pace:
+            gap = time.monotonic() - _last_call["at"]
+            if gap < MIN_INTERVAL_S:
+                time.sleep(MIN_INTERVAL_S - gap)
+            _last_call["at"] = time.monotonic()
 
         try:
             r = requests.post(
@@ -137,21 +152,37 @@ def ask_gateway(prompt: str, api_key: str | None, max_tokens: int = 900) -> str:
                 json=body,
                 timeout=30,
             )
-            _last_call["at"] = time.monotonic()
+            with _pace:
+                _last_call["at"] = time.monotonic()
 
             if r.status_code == 429:
-                # Honour the server's own advice when it gives any.
-                wait = float(r.headers.get("retry-after") or BACKOFF_S * (attempt + 1))
+                # Honour the server's own advice when it gives any — but the
+                # header is allowed to be an HTTP date, and float() on that
+                # raises ValueError, which is not a RequestException and so
+                # escaped the retry loop entirely.
+                wait = BACKOFF_S * (attempt + 1)
+                try:
+                    wait = float(r.headers["retry-after"])
+                except (KeyError, ValueError):
+                    pass
+                wait = min(wait, MAX_RETRY_AFTER_S)
                 print(f"[terms] rate limited, waiting {wait:.1f}s")
                 time.sleep(wait)
                 last = RuntimeError("rate limited")
                 continue
 
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            try:
+                return r.json()["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                # A 200 carrying an error envelope, or any change in shape.
+                # None of these are RequestException, so without this they
+                # skipped the retry and surfaced as a whole failed batch.
+                raise RuntimeError(f"unreadable gateway reply: {exc}") from exc
 
-        except requests.RequestException as exc:
-            _last_call["at"] = time.monotonic()
+        except (requests.RequestException, RuntimeError) as exc:
+            with _pace:
+                _last_call["at"] = time.monotonic()
             last = exc
             if attempt < RETRIES - 1:
                 time.sleep(BACKOFF_S * (attempt + 1))
@@ -178,7 +209,13 @@ class TermJudge:
         if not self.cache_path.exists():
             return
 
-        data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Losing the cache costs one re-judging pass. Refusing to start
+            # costs the lecture.
+            print(f"[terms] {self.cache_path.name} is unreadable ({exc}); starting fresh")
+            return
         # A cached verdict is never re-asked — that is the whole point of a
         # cache, and it is also how a change to the prompt goes unnoticed:
         # every word judged under the old rules keeps its old answer forever.
@@ -190,16 +227,18 @@ class TermJudge:
         self.cache = data.get("terms", {})
 
     def _save(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(
-            json.dumps(
-                {"prompt": PROMPT_FINGERPRINT, "terms": self.cache},
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
+        # Same reasoning as CourseGlossary.save: truncate-then-stream leaves a
+        # half file behind if anything else writes at the same moment.
+        body = json.dumps(
+            {"prompt": PROMPT_FINGERPRINT, "terms": dict(self.cache)},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cache_path.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, self.cache_path)
 
     def cached(self, words: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
         """
