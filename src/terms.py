@@ -70,6 +70,13 @@ EVERYDAY = {
     if w.strip()
 }
 
+# The memory learns from the transcript, so a judge that accepts a mishearing
+# does more than show one wrong definition: the word settles into the course,
+# goes out as a keyterm, and pushes recognition TOWARDS the mistake. A soak
+# test on a synthetic voice heard "the stack" as "ZStack" every time, and the
+# old rule ("rare words are terms unless plainly not technical") accepted it —
+# a brand name is rare and sounds technical. Rare is not the same as ours.
+#
 # Line format, not JSON. A small model asked for JSON copies the example's keys
 # verbatim — it answered {"term": "scanf"} instead of {"scanf": "..."} — while
 # judging the words correctly. One word per line, one separator, nothing to
@@ -85,10 +92,17 @@ Words marked (everyday) are ordinary English. Define one only when this
 subject gives it a different meaning from the one it has outside the lecture
 hall — a class or a stack in programming is not the everyday thing, so those
 get a definition. A program, a crash, an error or an output mean exactly what
-they always mean, so those get "no".
+they always mean, so those get "no". If you are not sure the meaning is
+different, answer "no" — an ordinary word highlighted as a term costs the
+student more than a term left for the sidebar.
 
-Unmarked words are rare outside this subject. Define them, unless they are
-plainly not technical.
+Unmarked words are rare in everyday English, but rare does not make them
+terms. Define an unmarked word only if it is a term, a name or a tool of
+{subject} — something a student of {subject} would need explained. An
+ordinary word the lecturer happens to use gets "no", however rare it is.
+These words also come from live speech recognition, so a word that does not
+fit {subject} at all — a product or brand name, a word from some other field —
+is usually a mishearing: answer "no".
 
 Definitions must be under {limit} characters — one line a student can read at a
 glance while the lecturer keeps talking.
@@ -98,6 +112,7 @@ Example for a lecture on databases:
     rollback = undoes every change made since the transaction began
     index (everyday) = a lookup structure that makes queries faster
     problem (everyday) = no
+    Zenbook = no
 
 Now do these words. Nothing else, no headings, no numbering:
 
