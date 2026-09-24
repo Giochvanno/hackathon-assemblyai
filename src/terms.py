@@ -81,7 +81,16 @@ EVERYDAY = {
 # verbatim — it answered {"term": "scanf"} instead of {"scanf": "..."} — while
 # judging the words correctly. One word per line, one separator, nothing to
 # nest and nothing to balance.
-PROMPT = """Subject: {subject}
+#
+# RETIRED. This is the judge that saw only the bare word. Kept because the
+# benchmarks compare against it — it is the "before" in every table.
+#
+# Why it went: on real speech, the ordinary rare words ("dichotomy", "hereafter",
+# "prefix") sit at exactly the same corpus frequency as the terms ("decimal",
+# "syntax", "heap") — zipf 2.4–4.3 against 1.4–4.2 — so neither a frequency
+# rule nor a stricter sentence in this prompt can tell them apart. On the
+# 35-word real-speech benchmark it let through 16.3 of 19 noise words.
+PROMPT_WORDS = """Subject: {subject}
 
 For each word below, write exactly one line:
 
@@ -119,8 +128,142 @@ Now do these words. Nothing else, no headings, no numbering:
 {words}"""
 
 
-def mark(word: str) -> str:
-    return f"{word} (everyday)" if word.lower() in EVERYDAY else word
+# The judge in production: each word with the sentence it was heard in.
+#
+# A word alone cannot say whether it is a term; the sentence can. "dichotomy"
+# and "decimal" are equally rare in English, but "so there's this dichotomy"
+# and "not using decimal but letters" are not equally about C.
+#
+# Measured before it shipped (src/bench_judge.py, 35 real-speech words, three
+# batch orders each):
+#
+#                     terms lost (of 14)   noise let through (of 19)
+#     bare word              0.0                   16.3
+#     with sentence          0.3                    3.0
+#
+# The rule fixed in advance said: ship only if it loses no more terms. It lost
+# one — "decimal", in one order of three — so by that rule it should not have
+# shipped. We shipped it anyway, knowingly: in a live lecture, thirteen false
+# highlights per nineteen cost the student more attention than one missed term
+# in forty-two verdicts, and the missed term is still in the transcript.
+# This text is the one that was measured; changing it means measuring again.
+PROMPT = """Subject: {subject}
+
+Each word below was heard in a live lecture, with the sentence it was said in.
+For each word, write exactly one line:
+
+    word = short definition, as the word is used in {subject}
+    word = no
+
+Give a definition only if, in that sentence, the word is used as a term of
+{subject} — something a student of {subject} would need explained. If the
+sentence uses it in its ordinary sense, if it belongs to some other field, or
+if it looks like a speech-recognition mistake, answer "no".
+
+Definitions must be under {limit} characters — one line a student can read at a
+glance while the lecturer keeps talking.
+
+Example, for a lecture on databases. The words:
+
+    rollback
+      heard in: "if the transfer fails, a rollback undoes every step it took"
+    table
+      heard in: "just put your laptop on the table for now"
+
+The answer:
+
+    rollback = undoes every change made since the transaction began
+    table = no
+
+Now these words. Answer with one line per word and nothing else:
+
+{words}"""
+
+# Long enough for a lecturer's sentence, short enough that twenty of them do
+# not crowd out the question. Turns on real speech ran 60-80 seconds, so
+# "the turn" is far too much context; the sentence is the unit.
+MAX_CONTEXT_CHARS = 240
+
+# A sentence ends at . ! or ? FOLLOWED BY SPACE. A bare period is not enough:
+# "stdio.h", "0x1F" and "./addresses" are all said in a C lecture, and cutting
+# there hands the judge half a sentence.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+def sentence_with(word: str, text: str) -> str | None:
+    """
+    The sentence of `text` that `word` was heard in, or None if it isn't there.
+    """
+    i = text.find(word)
+    if i < 0:
+        m = re.search(re.escape(word), text, re.IGNORECASE)
+        if not m:
+            return None
+        i = m.start()
+
+    # Search the whole text and keep the ends before the word. Stopping the
+    # search AT the word would make "$" match there, and "stdio.h" would end
+    # a sentence just because the word began after its dot.
+    start = 0
+    for m in _SENTENCE_END.finditer(text):
+        if m.end() > i:
+            break
+        start = m.end()
+    m = _SENTENCE_END.search(text, i + len(word))
+    end = m.end() if m else len(text)
+
+    s = " ".join(text[start:end].split())
+    if len(s) > MAX_CONTEXT_CHARS:
+        # A run-on sentence: keep a window around the word, not the head of it.
+        at = s.lower().find(word.lower())
+        lo = max(0, at - MAX_CONTEXT_CHARS // 2)
+        s = "…" + s[lo:lo + MAX_CONTEXT_CHARS].strip() + "…"
+    # It goes inside double quotes in the prompt.
+    return s.replace('"', "'")
+
+
+def build_prompt(subject: str, words: list[str],
+                 contexts: dict[str, str | None] | None = None) -> str:
+    """
+    The production question. A word with no sentence goes in bare.
+
+    The sentence sits on its own line after a label with a colon, so that if
+    the model echoes it back, parse_reply reads "heard in" as the key, finds it
+    is not a word we asked about, and skips it — instead of taking the
+    sentence for a definition.
+    """
+    contexts = contexts or {}
+    lines = [
+        f'{w}\n  heard in: "{contexts[w]}"' if contexts.get(w) else w
+        for w in words
+    ]
+    return PROMPT.format(subject=subject, limit=MAX_DEFINITION_CHARS,
+                         words="\n".join(lines))
+
+
+def is_everyday(word: str) -> bool:
+    """
+    Checked as spoken AND by stem. The list holds "screen" but not always
+    "screens", and a rule that lets the plural through while stopping the
+    singular is a rule with a hole exactly where lecturers talk in plurals.
+    """
+    from candidates import stem          # local: candidates imports nothing of ours
+    w = word.lower().strip(".,;:!?()\"'")
+    return w in EVERYDAY or stem(w) in EVERYDAY
+
+
+def mark(word: str, declared: frozenset[str] = frozenset()) -> str:
+    """
+    Tag an everyday word for the judge — unless the course has declared it.
+
+    A declared word is one the course says is a term here even though it is
+    ordinary English ("free", "address"). It goes to the judge untagged, as a
+    candidate term, because telling the judge it is everyday would get it
+    rejected: that is what the tag is for.
+    """
+    if word.lower() in declared:
+        return word
+    return f"{word} (everyday)" if is_everyday(word) else word
 
 
 # Short on purpose: it goes in every cache file and only has to detect change,
@@ -207,8 +350,10 @@ def ask_gateway(prompt: str, api_key: str | None, max_tokens: int = 900) -> str:
 
 class TermJudge:
     def __init__(self, subject: str, cache_dir: str = "glossary",
-                 course: str | None = None) -> None:
+                 course: str | None = None,
+                 declared: frozenset[str] = frozenset()) -> None:
         self.subject = subject
+        self.declared = frozenset(w.lower() for w in declared)
         # Named after the COURSE, not the subject. The subject is prose that
         # goes into the prompt ("C programming"); the course is the identity
         # ("c-programming"). Naming the file after the subject put a space in
@@ -236,7 +381,7 @@ class TermJudge:
         # every word judged under the old rules keeps its old answer forever.
         # The fingerprint makes the cache expire with the question that
         # produced it, so changing PROMPT is a code change and nothing else.
-        if data.get("prompt") != PROMPT_FINGERPRINT:
+        if data.get("prompt") != self.fingerprint():
             print(f"[terms] prompt changed — re-judging {self.subject} from scratch")
             return
         self.cache = data.get("terms", {})
@@ -245,7 +390,7 @@ class TermJudge:
         # Same reasoning as CourseGlossary.save: truncate-then-stream leaves a
         # half file behind if anything else writes at the same moment.
         body = json.dumps(
-            {"prompt": PROMPT_FINGERPRINT, "terms": dict(self.cache)},
+            {"prompt": self.fingerprint(), "terms": dict(self.cache)},
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -254,6 +399,22 @@ class TermJudge:
         tmp = self.cache_path.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(body, encoding="utf-8")
         os.replace(tmp, self.cache_path)
+
+    def fingerprint(self) -> str:
+        """
+        What the cached verdicts were answers to.
+
+        The course's declared words change the question: "free" asked while
+        tagged everyday was rejected and cached, and a cached word is never
+        asked again — so declaring it later would change nothing. Folding the
+        list into the fingerprint expires the cache when the list changes.
+        With nothing declared it is exactly the prompt's own fingerprint.
+        """
+        if not self.declared:
+            return PROMPT_FINGERPRINT
+        return hashlib.sha256(
+            (PROMPT_FINGERPRINT + "|" + ",".join(sorted(self.declared))).encode()
+        ).hexdigest()[:12]
 
     def cached(self, words: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
         """
@@ -281,15 +442,16 @@ class TermJudge:
         return defined, rejected, unknown
 
     # --- the call ------------------------------------------------------------
-    def _ask(self, words: list[str]) -> dict[str, str | None]:
-        prompt = PROMPT.format(
-            subject=self.subject,
-            limit=MAX_DEFINITION_CHARS,
-            words="\n".join(mark(w) for w in words),   # one per line, as the answer
-        )
+    def _ask(self, words: list[str],
+             contexts: dict[str, str | None] | None = None) -> dict[str, str | None]:
+        # No "(everyday)" tag any more: everyday words never reach the judge
+        # (server.observe drops them by rule), and the declared ones that do
+        # are meant to be judged as candidate terms — the sentence decides.
+        prompt = build_prompt(self.subject, words, contexts)
         return parse_reply(ask_gateway(prompt, self.api_key), words)
 
-    def judge(self, words: list[str]) -> dict[str, str]:
+    def judge(self, words: list[str],
+              contexts: dict[str, str | None] | None = None) -> dict[str, str]:
         """
         Returns {term: definition} for the words that are real terms.
 
@@ -305,7 +467,10 @@ class TermJudge:
         for i in range(0, len(unseen), BATCH):
             chunk = unseen[i : i + BATCH]
             try:
-                verdicts = self._ask(chunk)
+                # The verdict is cached per word, so the sentence it was FIRST
+                # heard in decides it for the course. The lecturer introduces
+                # a term when it first comes up, so that is the right sentence.
+                verdicts = self._ask(chunk, contexts)
             except Exception as exc:
                 failures.append(f"{type(exc).__name__}: {exc}")
                 continue

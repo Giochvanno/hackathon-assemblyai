@@ -79,4 +79,15 @@ def explain(subject: str, turns: list[str], terms: list[dict],
         transcript=recent_transcript(turns),
         terms=listed,
     )
-    return " ".join(ask_gateway(prompt, api_key, max_tokens=MAX_TOKENS).split())
+    return plain(ask_gateway(prompt, api_key, max_tokens=MAX_TOKENS))
+
+
+def plain(text: str) -> str:
+    """
+    The model answers in markdown — **bold** terms, `code` — and the panel
+    shows text, so on CS50 the student read literal asterisks. Keep the words,
+    drop the markup.
+    """
+    for mark_ in ("**", "__", "`"):
+        text = text.replace(mark_, "")
+    return " ".join(text.split())

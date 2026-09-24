@@ -6,6 +6,11 @@
       "first_seen": "2026-09-21",
       "surface": "ampersand"
     },
+    "function": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "function"
+    },
     "getchar": {
       "count": 1,
       "first_seen": "2026-09-21",
@@ -36,6 +41,11 @@
       "first_seen": "2026-09-21",
       "surface": "putchar"
     },
+    "return": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "return"
+    },
     "scanf": {
       "count": 5,
       "first_seen": "2026-09-21",
@@ -45,6 +55,11 @@
       "count": 2,
       "first_seen": "2026-09-21",
       "surface": "stdio"
+    },
+    "string": {
+      "count": 1,
+      "first_seen": "2026-09-21",
+      "surface": "string"
     },
     "value": {
       "count": 1,

@@ -171,6 +171,23 @@
 <script>
 const COURSE = "c-programming";
 const SUBJECT = "C programming";   // tells the judge what counts as a term here
+// The language the course is taught in. Without it the model detects language
+// on its own, turn by turn — and on a soak test with a synthetic voice it
+// decided mid-lecture that English was Hindi and wrote "you do not manage the
+// stack" in Devanagari. A lecturer with a strong accent risks the same drift,
+// and Korean is not among the streaming languages at all, so the model would
+// be guessing between the ones it has. It is a bias, not a lock, per the docs;
+// it is also the only lever the API offers.
+const LANGUAGE = "en";
+
+// How much silence ends a turn no matter what. The model otherwise decides by
+// meaning whether the speaker has "finished" — sensible for a voice agent
+// waiting for its user, wrong for a lecturer, who never finishes: on a real
+// CS50 lecture turns ran whole paragraphs, and since terms are judged only when
+// a turn closes, a definition landed a minute after its word. 640 ms is the
+// vendor's own "min_latency" preset, not a number of ours; a breath between
+// sentences is enough to close the turn.
+const MAX_TURN_SILENCE_MS = 640;
 const TARGET_RATE = 16000;          // what the streaming API expects
 const FRAME_MS = 50;
 
@@ -295,6 +312,9 @@ const STABLE_MS = 10000;
 
 let retry = 0;
 let openedAt = 0;
+// When this listening session began. Survives reconnects on purpose: a dropped
+// socket is not a new lecture.
+let sessionStartedAt = null;
 let retryTimer = null;
 let stopping = false;          // a close the user asked for is not a failure
 let framesTotal = 0;
@@ -362,6 +382,7 @@ async function start() {
   running = true;
   stopping = false;
   retry = 0;
+  sessionStartedAt = performance.now();
   // Leftovers from the previous session: half a frame of the morning lecture,
   // and a resampler still interpolating against its last sample.
   pending16 = new Int16Array(0);
@@ -428,6 +449,11 @@ async function openSocket() {
     encoding: "pcm_s16le",
     format_turns: "true"                  // keyterms only apply to formatted turns
   });
+  // A list, JSON-encoded in the query string — the same way keyterms_prompt
+  // goes, which the docs show with json.dumps. If the server ever refuses it,
+  // the socket closes at once and the close reason lands in the log below.
+  params.set("language_codes", JSON.stringify([LANGUAGE]));
+  params.set("max_turn_silence", String(MAX_TURN_SILENCE_MS));
   if (pre.keyterms.length) params.set("keyterms_prompt", JSON.stringify(pre.keyterms));
 
   if (!running) return;
@@ -538,8 +564,21 @@ function stop() {
   // and a socket still mid-handshake never heard the request at all — it used
   // to finish connecting after Stop and announce "listening" to a dead page.
   try {
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "Terminate" }));
-    ws?.close();
+    if (ws?.readyState === WebSocket.OPEN) {
+      // Ask the server to finish, and let it. On Terminate it turns the
+      // sentence in progress into a final turn and closes the socket itself
+      // with 1000. Closing from here at once cut that off: the last thing said
+      // before Stop never became a final turn, so its terms were never judged,
+      // and every clean ending showed up as 1005 "no status". The timeout is
+      // only for a server that never answers.
+      ws.send(JSON.stringify({ type: "Terminate" }));
+      const s = ws;
+      setTimeout(() => { if (s.readyState !== WebSocket.CLOSED) s.close(); }, 3000);
+    } else {
+      // Still connecting: there is nobody to ask. Close it, or it finishes
+      // the handshake into a stopped page and announces "listening".
+      ws?.close();
+    }
   } catch {}
   // NOT ws = null. A real socket fires onclose on a later tick, and the
   // identity guard there would then see ws === null, decide the event belongs
@@ -749,13 +788,18 @@ function markUp(el, fresh) {
   for (const t of fresh) el._terms.add(t.toLowerCase().replace(/[.,;:!?()"']/g, ""));
 
   const set = el._terms;
+  // First occurrence only. "pattern" three times in one paragraph is three
+  // interruptions for one piece of information.
+  const done = new Set();
   const frag = document.createDocumentFragment();
 
   for (const token of el.textContent.split(/(\s+)/)) {
     if (/^\s+$/.test(token) || token === "") { frag.append(token); continue; }
 
     const bare = token.replace(/[.,;:!?()"']/g, "");
-    if (!set.has(bare.toLowerCase())) { frag.append(token); continue; }
+    const key = bare.toLowerCase();
+    if (!set.has(key) || done.has(key)) { frag.append(token); continue; }
+    done.add(key);
 
     const at = token.indexOf(bare);
     frag.append(token.slice(0, at));              // leading quote, bracket…
@@ -819,7 +863,10 @@ async function askWhy() {
   try {
     const r = await fetch("/api/lost", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ course: COURSE, subject: SUBJECT, turns, window_s: WINDOW_S })
+      body: JSON.stringify({
+        course: COURSE, subject: SUBJECT, turns, window_s: WINDOW_S,
+        session_s: sessionStartedAt === null ? null : (performance.now() - sessionStartedAt) / 1000
+      })
     });
     if (!r.ok) { log(`/api/lost ${r.status}: ${(await r.text()).slice(0, 200)}`, "err"); return; }
     res = await r.json();
@@ -849,7 +896,8 @@ function showWhy(res) {
 
   // The rate on its own means nothing; against the lecture's own average it
   // says whether this really was a burst or just felt like one.
-  const mins = Math.round(WINDOW_S / 60);
+  // What the window actually covered: less than three minutes early on.
+  const mins = typeof d.window_minutes === "number" ? d.window_minutes : Math.round(WINDOW_S / 60);
   let rate = `${num(d.in_window)} new in ${mins} min · ${num(d.per_minute)}/min`;
   if (d.session_per_minute != null) {
     rate += ` · lecture average ${d.session_per_minute}/min`;

@@ -145,3 +145,10 @@ def test_a_long_transcript_is_trimmed_from_the_front(srv):
 
 def test_blank_turns_do_not_reach_the_model(srv):
     assert recent_transcript(["", "  ", "real speech"]) == "real speech"
+
+
+def test_markdown_from_the_model_does_not_reach_the_student():
+    """On CS50 the panel showed **notation** with the asterisks."""
+    from lost import plain
+    assert plain("the **notation** called `hexadecimal`,\n  base 16") == \
+        "the notation called hexadecimal, base 16"

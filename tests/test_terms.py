@@ -170,3 +170,92 @@ def test_everyday_words_are_marked_and_rare_ones_are_not():
 
 def test_marking_is_case_insensitive():
     assert mark("Program") == "Program (everyday)"
+
+# --- the course's declared words ---------------------------------------------
+
+def test_a_declared_word_is_not_tagged_everyday():
+    assert mark("free") == "free (everyday)"
+    assert mark("free", frozenset({"free"})) == "free"
+
+
+def test_declaring_a_word_expires_the_cache(tmp_path, model):
+    """
+    "free" judged while tagged everyday was cached as rejected. A cached word
+    is never asked again, so without this, declaring it would change nothing.
+    """
+    model()
+    j = TermJudge("C programming", cache_dir=str(tmp_path), course="c")
+    j.cache = {"free": None}
+    j._save()
+
+    j2 = TermJudge("C programming", cache_dir=str(tmp_path), course="c",
+                   declared=frozenset({"free"}))
+    assert j2.cache == {}
+
+
+def test_declaring_nothing_keeps_the_old_fingerprint(tmp_path):
+    j = TermJudge("C programming", cache_dir=str(tmp_path), course="c")
+    assert j.fingerprint() == PROMPT_FINGERPRINT
+
+
+def test_a_plural_of_an_everyday_word_is_everyday_too():
+    """On CS50, "screen" was stopped and "screens" was highlighted."""
+    from terms import is_everyday
+    assert is_everyday("screen") and is_everyday("screens")
+    assert not is_everyday("pointers")
+
+
+# --- the sentence the judge decides by ---------------------------------------
+#
+# On real speech, "dichotomy" and "decimal" are equally rare in English. Only
+# the sentence tells them apart, so the sentence has to arrive intact: the
+# right one, whole, and not the entire 70-second turn around it.
+
+from terms import build_prompt, sentence_with
+
+
+def test_the_judge_gets_the_sentence_not_the_whole_turn():
+    turn = ("So there's this dichotomy. We need some convention for the reader. "
+            "Just 0x means here comes a hexadecimal number.")
+    assert sentence_with("dichotomy", turn) == "So there's this dichotomy."
+    assert sentence_with("hexadecimal", turn) == "Just 0x means here comes a hexadecimal number."
+
+
+def test_a_dot_inside_code_does_not_end_the_sentence():
+    """stdio.h, 0x1F and ./addresses are all said in a C lecture."""
+    turn = "Let me include stdio.h at the top. Then run ./addresses and see."
+    assert sentence_with("include", turn) == "Let me include stdio.h at the top."
+    assert sentence_with("addresses", turn) == "Then run ./addresses and see."
+
+
+def test_a_run_on_sentence_is_cut_around_the_word():
+    turn = "and " * 100 + "then the pointer moves " + "and " * 100
+    s = sentence_with("pointer", turn)
+    assert "pointer" in s
+    assert len(s) <= terms_module.MAX_CONTEXT_CHARS + 2      # plus the two ellipses
+
+
+def test_a_word_not_in_the_turn_has_no_sentence():
+    assert sentence_with("malloc", "nothing about memory here") is None
+
+
+def test_quotes_in_speech_cannot_break_the_prompt():
+    assert '"' not in sentence_with("printf", 'printf says "hello"')
+
+
+def test_the_prompt_shows_each_sentence_and_tolerates_a_missing_one():
+    p = build_prompt("C programming", ["heap", "malloc"],
+                     {"heap": "the block goes back to the heap"})
+    assert 'heap\n  heard in: "the block goes back to the heap"' in p
+    assert "\nmalloc" in p and 'malloc\n  heard in' not in p
+
+
+def test_an_echoed_sentence_is_not_taken_for_a_definition():
+    reply = 'heap = memory you allocate yourself\n  heard in: "the block goes back"'
+    assert parse_reply(reply, ["heap"]) == {"heap": "memory you allocate yourself"}
+
+
+def test_a_word_glued_to_a_dot_still_gets_its_whole_sentence():
+    """Heard on CS50: "stdio.hstdioh.h". The judge got "hstdioh.h." and nothing else."""
+    turn = "From this memory. Let me include stdio.hstdioh.h. Then main."
+    assert sentence_with("hstdioh", turn) == "Let me include stdio.hstdioh.h."

@@ -322,3 +322,122 @@ def test_an_absurd_window_is_clamped_rather_than_honoured(srv, explainer):
     r = TestClient(srv.app).post("/api/lost",
                                  json={"course": "c", "window_s": 10 ** 9}).json()
     assert r["density"]["per_minute"] == 0.0     # no terms, and no division blow-up
+
+
+# --- everyday English is decided by rule, not by the model --------------------
+
+def test_an_everyday_word_never_reaches_the_judge(srv, model):
+    """
+    On a real lecture the model accepted "super", "actual" and "store" and
+    rejected "function" and "return": wrong in both directions in this band.
+    So the band is not asked about at all, and costs no gateway call.
+    """
+    fake = model()
+    with client(srv) as c:
+        body = observe(c, "this is super obvious, malloc gives you memory")
+        srv.flush("c")
+
+    assert "super" not in body["pending"]
+    assert "malloc" in body["pending"], "rare words still go to the judge"
+    assert all("super" not in batch for batch in fake.asked)
+    assert srv.glossary_for("c").is_new("super") is True, "and it leaves the memory"
+
+
+def test_a_word_the_course_declares_is_judged_after_all(srv, model):
+    srv.SEED_DIR.mkdir(parents=True, exist_ok=True)
+    (srv.SEED_DIR / "c.terms.txt").write_text("# comment\nfree   # the function\n")
+    model()
+    with client(srv) as c:
+        body = observe(c, "you must free the block")
+
+    assert "free" in body["pending"]
+
+
+def test_a_declared_word_reaches_the_judge_untagged(srv, model, monkeypatch):
+    """Tagging "free" as everyday would get it rejected — the tag exists for that."""
+    srv.SEED_DIR.mkdir(parents=True, exist_ok=True)
+    (srv.SEED_DIR / "c.terms.txt").write_text("free\n")
+    import terms
+    sent = []
+    monkeypatch.setattr(terms, "ask_gateway",
+                        lambda prompt, key, max_tokens=900: sent.append(prompt) or "free = releases memory")
+    j = srv.judge_for("c", "C programming")
+    j.api_key = "k"
+    j._ask(["free"])
+
+    assert "free (everyday)" not in sent[0]
+    assert "\nfree" in sent[0]
+
+
+def test_a_course_without_a_terms_file_declares_nothing(srv):
+    assert srv.declared_for("c") == frozenset()
+
+
+# --- the density line in the first minutes ------------------------------------
+
+def test_a_young_session_is_not_divided_by_a_full_window(srv, explainer):
+    """
+    Two minutes into a lecture, a three-minute window used to divide by three,
+    so the burst the student pressed the button for read as calmer than
+    average.
+    """
+    import time
+    explainer()
+    now = time.monotonic()
+    srv._introduced["c"] = [{"term": t, "definition": "", "at": now - 30}
+                            for t in ("malloc", "heap", "pointer", "free")]
+
+    body = TestClient(srv.app).post("/api/lost", json={
+        "course": "c", "turns": ["…"], "window_s": 180, "session_s": 120}).json()
+
+    assert body["density"]["window_minutes"] == 2.0
+    assert body["density"]["per_minute"] == 2.0          # 4 terms over 2 minutes, not 3
+    assert body["density"]["session_per_minute"] == 2.0
+
+
+def test_an_earlier_sitting_does_not_count_towards_this_one(srv, explainer):
+    import time
+    explainer()
+    now = time.monotonic()
+    srv._introduced["c"] = [
+        {"term": "printf", "definition": "", "at": now - 600},   # last session
+        {"term": "malloc", "definition": "", "at": now - 20},
+    ]
+
+    body = TestClient(srv.app).post("/api/lost", json={
+        "course": "c", "turns": ["…"], "window_s": 180, "session_s": 60}).json()
+
+    assert [t["term"] for t in body["terms"]] == ["malloc"]
+    assert body["density"]["session_per_minute"] == 1.0
+
+
+# --- the sentence travels with the word --------------------------------------
+
+def test_a_queued_word_reaches_the_judge_with_its_sentence(srv, model):
+    fake = model()
+    with client(srv) as c:
+        observe(c, "So there's this dichotomy. Then we call malloc on it.")
+        srv.flush("c")
+
+    assert fake.contexts["dichotomy"] == "So there's this dichotomy."
+    assert fake.contexts["malloc"] == "Then we call malloc on it."
+
+
+def test_the_first_sentence_a_word_was_heard_in_is_the_one_judged(srv, model):
+    fake = model()
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        observe(c, "Again malloc, said differently.")
+        srv.flush("c")
+
+    assert fake.contexts["malloc"] == "We call malloc here."
+
+
+def test_a_retry_keeps_the_sentence(srv, model):
+    """A retry judged on the bare word is the old judge, the one that let noise through."""
+    model(fails=True)
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        srv.flush("c")
+
+    assert srv._pending["c"]["malloc"] == "We call malloc here."

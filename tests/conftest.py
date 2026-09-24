@@ -37,9 +37,12 @@ class FakeModel:
         self.omits = {w.lower() for w in omits}
         self.fails = fails
         self.asked: list[list[str]] = []
+        self.contexts: dict[str, str | None] = {}   # the sentence each word was judged by
 
-    def __call__(self, judge, words):
+    def __call__(self, judge, words, contexts=None):
         self.asked.append(list(words))
+        for w in words:
+            self.contexts[w] = (contexts or {}).get(w)
         if self.fails:
             raise RuntimeError("gateway did not answer")
         lines = [
@@ -56,7 +59,7 @@ def model(monkeypatch):
     def install(**kwargs):
         fake = FakeModel(**kwargs)
         monkeypatch.setattr(terms_module.TermJudge, "_ask",
-                            lambda self, words: fake(self, words))
+                            lambda self, words, contexts=None: fake(self, words, contexts))
         return fake
     return install
 
@@ -85,14 +88,16 @@ def srv(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DATA_DIR", tmp_path / "glossary")
     monkeypatch.setattr(server, "SEED_DIR", tmp_path / "seed")
     for store in (server._courses, server._judges, server._pending,
-                  server._resolved, server._introduced, server._attempts):
+                  server._resolved, server._introduced, server._attempts,
+                  server._declared):
         store.clear()
 
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
     yield server
 
     for store in (server._courses, server._judges, server._pending,
-                  server._resolved, server._introduced, server._attempts):
+                  server._resolved, server._introduced, server._attempts,
+                  server._declared):
         store.clear()
 
 @pytest.fixture

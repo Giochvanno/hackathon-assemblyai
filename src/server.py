@@ -36,8 +36,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import lost
+from candidates import stem
 from glossary import CourseGlossary
-from terms import BATCH, TermJudge
+from terms import BATCH, TermJudge, is_everyday, sentence_with
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -89,7 +90,9 @@ _judges: dict[str, TermJudge] = {}
 # Words waiting to be judged, and verdicts waiting to be collected.
 # dict, not list: it keeps insertion order and drops duplicates for free, so a
 # word repeated three times in one breath costs one question, not three.
-_pending: dict[str, dict[str, None]] = {}
+# The value is the sentence the word was first heard in: the judge decides by
+# it, and a word said three times is judged by the first of the three.
+_pending: dict[str, dict[str, str | None]] = {}
 _resolved: dict[str, list[dict]] = {}
 
 # Every term this run has introduced, with the moment it happened. The glossary
@@ -97,6 +100,9 @@ _resolved: dict[str, list[dict]] = {}
 # is the only way to answer "what landed on me in the last three minutes".
 # Kept in memory on purpose: it describes one sitting, not the course.
 _introduced: dict[str, list[dict]] = {}
+
+# Per course: everyday English words the course says are terms here.
+_declared: dict[str, frozenset[str]] = {}
 
 # How many times each queued word has been asked about, so a failure can be
 # retried without becoming a loop.
@@ -140,17 +146,44 @@ def glossary_for(name: str) -> CourseGlossary:
         return _courses[name]
 
 
+def declared_for(name: str) -> frozenset[str]:
+    """
+    The course's own list of everyday words that are terms in it.
+
+    Read from seed/<course>.terms.txt: shipped with the repository like the
+    seed, one word per line, # for comments. It is configuration, not memory —
+    nothing the course learns ever writes to it — so it is read in place rather
+    than planted into DATA_DIR. A course without the file declares nothing.
+    """
+    with _lock:
+        if name not in _declared:
+            path = SEED_DIR / f"{name}.terms.txt"
+            words = set()
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    word = line.split("#", 1)[0].strip().lower()
+                    if word:
+                        words.add(word)
+            _declared[name] = frozenset(words)
+        return _declared[name]
+
+
+def is_declared(word: str, declared: frozenset[str]) -> bool:
+    return word.lower() in declared or stem(word) in declared
+
+
 def judge_for(name: str, subject: str | None = None) -> TermJudge:
+    declared = declared_for(name)
     with _lock:
         if name not in _judges:
             _judges[name] = TermJudge(subject or name, cache_dir=str(DATA_DIR),
-                                      course=name)
+                                      course=name, declared=declared)
         return _judges[name]
 
 
 # --- the background worker ---------------------------------------------------
 
-def requeue(name: str, word: str) -> bool:
+def requeue(name: str, word: str, context: str | None = None) -> bool:
     """
     Put a word back in the queue for one more try. Caller holds _lock.
 
@@ -164,7 +197,9 @@ def requeue(name: str, word: str) -> bool:
     if tries[word] >= MAX_ATTEMPTS:
         tries.pop(word, None)
         return False
-    _pending.setdefault(name, {})[word] = None
+    # With its sentence: a retry judged on the bare word is a different
+    # question, and the one the old judge got wrong.
+    _pending.setdefault(name, {}).setdefault(word, context)
     return True
 
 
@@ -177,14 +212,13 @@ def flush(name: str) -> None:
         if not queue:
             return
         words = list(queue)[:BATCH]
-        for w in words:
-            queue.pop(w, None)
+        contexts = {w: queue.pop(w, None) for w in words}
 
     g = glossary_for(name)
     j = judge_for(name)
 
     try:
-        defined = j.judge(words)
+        defined = j.judge(words, contexts)
     except Exception as exc:
         # The model could not be reached. Put the words back — a thirty-second
         # network blip used to cost the lecture every term spoken during it,
@@ -192,7 +226,7 @@ def flush(name: str) -> None:
         # appears as "first time" again and so is never re-queued by itself.
         print(f"[flush] {exc}")
         with _lock:
-            spent = [w for w in words if not requeue(name, w)]
+            spent = [w for w in words if not requeue(name, w, contexts.get(w))]
             if spent:
                 # Out of tries. Show them undefined rather than in silence: the
                 # term still belongs to the lecture, it just has no line yet.
@@ -230,7 +264,7 @@ def flush(name: str) -> None:
         for w in defined:
             _attempts.get(name, {}).pop(w, None)
         for w in unjudged:
-            if requeue(name, w):
+            if requeue(name, w, contexts.get(w)):
                 print(f"[flush] no verdict for {w!r} — asking again")
             else:
                 print(f"[flush] gave up on {w!r} after {MAX_ATTEMPTS} attempts")
@@ -302,6 +336,10 @@ class LostIn(BaseModel):
     # server never stores a lecture, which is somebody else's speech.
     turns: list[str] = []
     window_s: float = 180.0
+    # How long this listening session has run. Without it a two-minute-old
+    # lecture was divided by a three-minute window, and the one moment worth
+    # pressing the button in looked calmer than average.
+    session_s: float | None = None
 
 
 @app.get("/api/token")
@@ -343,6 +381,20 @@ def observe(turn: TurnIn) -> dict:
     j = judge_for(turn.course, turn.subject)
 
     fresh = g.observe_turn(turn.text)
+
+    # Everyday English never reaches the judge unless the course declares it.
+    # On a real lecture the model got this band wrong in both directions — it
+    # rejected "function" and "return", and accepted "super", "actual" and
+    # "store" — so asking it there is a coin toss. A rule decides instead, and
+    # the course names its exceptions. The model keeps the rare band, where
+    # it is reliable. Half the words never cost a gateway call, which is also
+    # what keeps the queue from growing behind a fast lecturer.
+    declared = declared_for(turn.course)
+    ordinary = [w for w in fresh if is_everyday(w) and not is_declared(w, declared)]
+    for w in ordinary:
+        g.forget(w)
+    fresh = [w for w in fresh if w not in ordinary]
+
     defined, rejected, unknown = j.cached(fresh)
 
     for w in defined:
@@ -355,7 +407,9 @@ def observe(turn: TurnIn) -> dict:
         with _lock:
             queue = _pending.setdefault(turn.course, {})
             for w in unknown:
-                queue[w] = None
+                # The first sentence wins; a later mention does not replace it.
+                if queue.get(w) is None:
+                    queue[w] = sentence_with(w, turn.text)
 
     g.save()
     return {
@@ -405,11 +459,17 @@ def im_lost(body: LostIn) -> dict:
     with _lock:
         events = list(_introduced.get(body.course, []))
 
-    window = [e for e in events if now - e["at"] <= window_s]
-    minutes = window_s / 60.0
+    # The window cannot reach back past the start of this session: whatever
+    # is older belongs to an earlier sitting, and a rate divided by time that
+    # never happened is too small.
+    session_s = body.session_s
+    covered_s = window_s if session_s is None else max(10.0, min(window_s, session_s))
+    window = [e for e in events if now - e["at"] <= covered_s]
+    minutes = covered_s / 60.0
 
     density = {
         "in_window": len(window),
+        "window_minutes": round(minutes, 1),
         "per_minute": round(len(window) / minutes, 2) if minutes else 0.0,
         "session_per_minute": None,
     }
@@ -417,7 +477,11 @@ def im_lost(body: LostIn) -> dict:
     # own average so far is the fairest baseline we have: it needs no extra
     # data and it adapts to how fast this particular lecturer introduces
     # things. Below half a minute of material it says nothing, so we say so.
-    if events:
+    if session_s is not None:
+        session = [e for e in events if now - e["at"] <= session_s]
+        if session_s >= 30:
+            density["session_per_minute"] = round(len(session) / (session_s / 60.0), 2)
+    elif events:
         span_min = (now - events[0]["at"]) / 60.0
         if span_min >= 0.5:
             density["session_per_minute"] = round(len(events) / span_min, 2)

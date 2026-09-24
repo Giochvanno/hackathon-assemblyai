@@ -1,0 +1,16 @@
+# Everyday English words that are terms in this course.
+#
+# Everyday words (the ~3,900 most common in English) are never highlighted:
+# the judge model cannot tell "free" the function from "free" the adjective,
+# and on a real lecture it got that band wrong in both directions. This list
+# is the course saying which of them it means technically.
+#
+# The rule for adding a word: in a lecture on this course it is almost always
+# used in its technical sense, AND a student meeting it for the first time
+# would want it explained. "while", "case", "main", "long" fail the first test
+# ("a long time", "in this case") and would bring the noise straight back.
+# Basics the course has already taught belong in the seed, not here.
+
+free        # releases memory obtained from malloc
+address     # where a value lives in memory — what & gives you
+union       # the keyword, not the political kind

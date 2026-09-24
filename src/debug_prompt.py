@@ -16,13 +16,21 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from terms import GATEWAY, MODEL, PROMPT, MAX_DEFINITION_CHARS, mark, parse_reply
+from terms import GATEWAY, MODEL, build_prompt, parse_reply
 
 # A deliberate mix: rare terms, ordinary words, and the hard middle —
 # "class" and "stack" are everyday words that this subject redefines,
 # "program" and "crash" are everyday words that it does not.
 WORDS = ["scanf", "printf", "malloc", "ampersand", "segmentation",
-         "class", "stack", "program", "crash", "output", "please"]
+         "class", "stack", "program", "crash", "output", "please",
+         # Mishearings the soak test produced — these must be "no" —
+         # and real proper nouns of the subject, which must NOT be caught by
+         # the same rule. A fix that rejects Valgrind has broken something.
+         "ZStack", "Zephyrus", "Valgrind", "POSIX",
+         # What leaked on the soak test: ordinary words that must be "no" —
+         # and the core terms that the stricter rule must still let through.
+         "written", "depend", "treat", "memory",
+         "pointer", "heap", "array", "union"]
 
 
 def main() -> None:
@@ -37,11 +45,9 @@ def main() -> None:
     if not key:
         sys.exit("No ASSEMBLYAI_API_KEY")
 
-    prompt = PROMPT.format(
-        subject="C programming",
-        limit=MAX_DEFINITION_CHARS,
-        words="\n".join(mark(w) for w in WORDS),
-    )
+    # The production prompt. No sentences here: this tool is for seeing the
+    # raw reply and the parse, and a bare word is the harder case.
+    prompt = build_prompt("C programming", WORDS)
 
     print("=" * 70)
     print("PROMPT SENT")
