@@ -259,3 +259,34 @@ def test_a_word_glued_to_a_dot_still_gets_its_whole_sentence():
     """Heard on CS50: "stdio.hstdioh.h". The judge got "hstdioh.h." and nothing else."""
     turn = "From this memory. Let me include stdio.hstdioh.h. Then main."
     assert sentence_with("hstdioh", turn) == "Let me include stdio.hstdioh.h."
+
+
+# --- a rejection in a sentence -----------------------------------------------
+
+@pytest.mark.parametrize("answer", [
+    "not a C programming term",
+    "Not a term in C programming.",
+    "not an OS term",
+    "no, ordinary word",
+    "no (everyday sense)",
+])
+def test_a_rejection_written_as_a_phrase_is_still_a_rejection(answer):
+    """CS50, live: five words shown with the definition "not a C programming term"."""
+    assert parse_reply(f"zoom = {answer}", ["zoom"]) == {"zoom": None}
+
+
+@pytest.mark.parametrize("definition", [
+    "not a valid address; the pointer that points nowhere",
+    "notation for numbers in base 16",
+    "nothing is returned",
+])
+def test_a_definition_that_starts_like_a_rejection_is_kept(definition):
+    assert parse_reply(f"null = {definition}", ["null"])["null"] == definition
+
+
+def test_a_cached_phrase_rejection_is_read_as_a_rejection(tmp_path, judge):
+    judge.cache = {"zoom": "not a C programming term", "heap": "memory you manage"}
+    judge._save()
+
+    reopened = TermJudge("C programming", cache_dir=str(tmp_path), course="c-programming")
+    assert reopened.cache == {"zoom": None, "heap": "memory you manage"}

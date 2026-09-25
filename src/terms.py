@@ -384,7 +384,13 @@ class TermJudge:
         if data.get("prompt") != self.fingerprint():
             print(f"[terms] prompt changed — re-judging {self.subject} from scratch")
             return
-        self.cache = data.get("terms", {})
+        # A cache written before is_rejection knew every phrasing may hold
+        # "not a C programming term" as a definition. Read it the way the
+        # parser now would, so the fix reaches words judged before it.
+        self.cache = {
+            k: (None if is_rejection(v) else v)
+            for k, v in data.get("terms", {}).items()
+        }
 
     def _save(self) -> None:
         # Same reasoning as CourseGlossary.save: truncate-then-stream leaves a
@@ -497,6 +503,22 @@ class TermJudge:
 SEPARATORS = ("=", "—", ":", "|", " - ")
 REJECTIONS = {"no", "-", "none", "null", "n/a", "not a term", "ordinary"}
 
+# The model does not always say "no" in one word. On CS50 it answered
+# "zoom = not a C programming term" — five times in one lecture — and the
+# parser, finding text after the "=", showed it as a definition: the model had
+# rejected the word and the student saw it highlighted anyway. The word "term"
+# is required, so a real definition that happens to start the same way
+# ("NULL = not a valid address") is still a definition.
+_REFUSAL = re.compile(r"^not (a|an)\b.*\bterm\b|^no\s*[,;:(—]", re.IGNORECASE)
+
+
+def is_rejection(value: str | None) -> bool:
+    """True when the model's answer says "not a term", in any of its phrasings."""
+    if not value:
+        return True
+    v = value.strip().strip("`\"'").rstrip(".").strip()
+    return not v or v.lower() in REJECTIONS or bool(_REFUSAL.search(v))
+
 
 def parse_reply(content: str, asked: list[str]) -> dict[str, str | None]:
     """
@@ -527,7 +549,7 @@ def parse_reply(content: str, asked: list[str]) -> dict[str, str | None]:
                 break  # a line about something else; don't try other separators
 
             value = right.strip().strip("`\"'").rstrip(".")
-            if not value or value.lower() in REJECTIONS:
+            if is_rejection(value):
                 out[key] = None
             else:
                 text = " ".join(value.split())
