@@ -21,7 +21,13 @@ transcripts/
 *.mp4
 
 # Course memory and cached definitions — machine state, regenerated on use.
+# The star catches the copies set aside before a clean test run
+# (glossary-run1, glossary-0926-night, ...).
 glossary/
+glossary*/
+
+# Files the Claude desktop app saves into the project folder.
+Claude outputs/
 
 # The before/after proof for the demo. Keep the files, keep them out of git:
 # they contain a full lecture transcript.

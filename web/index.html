@@ -188,6 +188,15 @@ const LANGUAGE = "en";
 // vendor's own "min_latency" preset, not a number of ours; a breath between
 // sentences is enough to close the turn.
 const MAX_TURN_SILENCE_MS = 640;
+
+// A ceiling on how long one turn may run, silence or not. On CS50 even 640 ms
+// did not close turns: the lecturer never paused that long, and turns ran for
+// 60–80 seconds, so a term was defined up to a minute after it was said. A
+// timer does not depend on how anyone breathes — past this, the browser asks
+// the server to end the turn with ForceEndpoint, and the final text comes back
+// at once. The cost is a sentence occasionally cut in two, which does not
+// matter to finding terms and matters a great deal less than a minute's wait.
+const MAX_TURN_MS = 10000;
 const TARGET_RATE = 16000;          // what the streaming API expects
 const FRAME_MS = 50;
 
@@ -479,6 +488,8 @@ async function openSocket() {
     // the gap was and never come back.
     streamStart = performance.now();
     lastWordEnd = null;
+    turnOpenedAt = null;
+    turnForced = false;
     openedAt = performance.now();
     if (retry) log(`reconnected after ${retry} attempt(s)`, "ok");
     log("socket open", "ok");
@@ -603,6 +614,8 @@ function stop() {
 
 let partialEl = null;
 let lastWordEnd = null;
+let turnOpenedAt = null;     // first partial of the turn in progress
+let turnForced = false;      // ForceEndpoint already sent for it
 
 function handle(msg) {
   if (msg.type !== "Turn") return;
@@ -626,6 +639,8 @@ function handle(msg) {
       }
     }
     lastWordEnd = null;
+    turnOpenedAt = null;
+    turnForced = false;
     partialEl?.remove();
     partialEl = null;
     finalise(msg.transcript);
@@ -637,6 +652,13 @@ function handle(msg) {
     }
     partialEl.textContent = msg.transcript;
     keepUp(transcript);
+
+    if (turnOpenedAt === null) turnOpenedAt = performance.now();
+    if (!turnForced && performance.now() - turnOpenedAt > MAX_TURN_MS &&
+        ws?.readyState === WebSocket.OPEN) {
+      turnForced = true;       // once per turn; the answer is on its way
+      ws.send(JSON.stringify({ type: "ForceEndpoint" }));
+    }
   }
 }
 
