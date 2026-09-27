@@ -89,7 +89,7 @@ def srv(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "SEED_DIR", tmp_path / "seed")
     for store in (server._courses, server._judges, server._pending,
                   server._resolved, server._introduced, server._attempts,
-                  server._declared):
+                  server._declared, server._inflight):
         store.clear()
 
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
@@ -97,7 +97,7 @@ def srv(tmp_path, monkeypatch):
 
     for store in (server._courses, server._judges, server._pending,
                   server._resolved, server._introduced, server._attempts,
-                  server._declared):
+                  server._declared, server._inflight):
         store.clear()
 
 @pytest.fixture

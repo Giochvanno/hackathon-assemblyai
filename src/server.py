@@ -95,6 +95,12 @@ _judges: dict[str, TermJudge] = {}
 _pending: dict[str, dict[str, str | None]] = {}
 _resolved: dict[str, list[dict]] = {}
 
+# Words taken off the queue and now with the judge. They are in neither the
+# queue nor the verdicts, and a judge that has hit the rate limit can hold
+# them for thirty seconds — long enough for the browser, told "nothing
+# waiting", to stop listening for them. /api/updates counts them as waiting.
+_inflight: dict[str, int] = {}
+
 # Every term this run has introduced, with the moment it happened. The glossary
 # knows THAT a term is known; this knows WHEN the student first met it, which
 # is the only way to answer "what landed on me in the last three minutes".
@@ -213,7 +219,28 @@ def flush(name: str) -> None:
             return
         words = list(queue)[:BATCH]
         contexts = {w: queue.pop(w, None) for w in words}
+        _inflight[name] = _inflight.get(name, 0) + len(words)
 
+    # Released in the same locked step that publishes the verdicts, so "none
+    # waiting" and "here are the last definitions" arrive in one response. The
+    # finally is for whatever else might raise on the way.
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _inflight[name] = max(0, _inflight.get(name, 0) - len(words))
+
+    try:
+        _judge_and_publish(name, words, contexts, release)
+    finally:
+        if not released:
+            with _lock:
+                release()
+
+
+def _judge_and_publish(name: str, words: list[str], contexts: dict, release) -> None:
     g = glossary_for(name)
     j = judge_for(name)
 
@@ -233,6 +260,7 @@ def flush(name: str) -> None:
                 _resolved.setdefault(name, []).extend(
                     {"term": w, "definition": "", "note": str(exc)} for w in spent
                 )
+            release()
         return
 
     # Three outcomes again, and the middle one is the trap. A word the reply
@@ -268,6 +296,7 @@ def flush(name: str) -> None:
                 print(f"[flush] no verdict for {w!r} — asking again")
             else:
                 print(f"[flush] gave up on {w!r} after {MAX_ATTEMPTS} attempts")
+        release()
 
     try:
         g.save()
@@ -434,7 +463,7 @@ def updates(course: str = "default") -> dict:
     g = glossary_for(course)
     with _lock:
         terms = _resolved.pop(course, [])
-        waiting = len(_pending.get(course, {}))
+        waiting = len(_pending.get(course, {})) + _inflight.get(course, 0)
     return {
         "terms": terms,
         "waiting": waiting,

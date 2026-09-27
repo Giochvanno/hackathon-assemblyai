@@ -441,3 +441,38 @@ def test_a_retry_keeps_the_sentence(srv, model):
         srv.flush("c")
 
     assert srv._pending["c"]["malloc"] == "We call malloc here."
+
+
+# --- words with the judge still count as waiting -------------------------------
+
+def test_words_being_judged_still_count_as_waiting(srv, monkeypatch):
+    """
+    A rehearsal: Stop pressed, six terms with a judge sitting out a 25-second
+    rate limit. The queue was empty, so the server said "nothing waiting", the
+    page stopped listening, and the end of the lecture never reached the
+    glossary. Words taken off the queue are not done until their verdict is.
+    """
+    import terms
+    seen = []
+
+    def slow_judge(self, words, contexts=None):
+        seen.append(srv.updates("c")["waiting"])        # asked mid-judgement
+        return {w.lower(): "a term" for w in words}
+
+    monkeypatch.setattr(terms.TermJudge, "_ask", slow_judge)
+    with client(srv) as c:
+        observe(c, "We call malloc on the heap.")
+        srv.flush("c")
+        after = c.get("/api/updates", params={"course": "c"}).json()
+
+    assert seen and seen[0] >= 2, "in flight, the words were reported as done"
+    assert after["waiting"] == 0
+    assert {t["term"] for t in after["terms"]} >= {"malloc", "heap"}
+
+
+def test_a_failed_judgement_is_not_left_counted_forever(srv, model):
+    model(fails=True)
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        srv.flush("c")
+    assert srv._inflight.get("c", 0) == 0

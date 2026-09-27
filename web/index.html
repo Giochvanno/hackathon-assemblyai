@@ -791,13 +791,29 @@ function stop() {
   try { audioCtx?.close(); } catch {}
   stream?.getTracks().forEach(t => t.stop());
 
-  // The last sentences are still being judged. Keep collecting for a few more
-  // seconds instead of dropping their definitions on the floor — but only this
-  // poller, in case listening starts again in the meantime.
+  // The last sentences are still being judged. Keep collecting until the
+  // server says nothing is left — not for a fixed ten seconds: on a rehearsal
+  // six terms were still with a rate-limited judge (25 s) when that ran out,
+  // and the end of the lecture never reached the glossary. Only this poller,
+  // in case listening starts again in the meantime; never longer than the cap.
   const mine = pollTimer;
-  setTimeout(() => {
-    if (pollTimer === mine) { clearInterval(pollTimer); pollTimer = null; }
-  }, 10000);
+  if (!mine) return;
+  lastWaiting = null;                     // only a poll after Stop counts
+  let quiet = 0;
+  const began = performance.now();
+  log("collecting the last definitions…");
+  const drain = setInterval(() => {
+    if (pollTimer !== mine) { clearInterval(drain); return; }
+    quiet = lastWaiting === 0 ? quiet + 1 : 0;
+    const tooLong = performance.now() - began > DRAIN_MAX_MS;
+    if (quiet >= 2 || tooLong) {
+      clearInterval(drain);
+      clearInterval(pollTimer);
+      pollTimer = null;
+      log(tooLong ? "stopped waiting for definitions after two minutes"
+                  : "all definitions are in", tooLong ? "warn" : "ok");
+    }
+  }, 1500);
 }
 
 /* ---------- transcript ----------------------------------------------------- */
@@ -930,6 +946,10 @@ async function finalise(text) {
 const awaiting = new Map();
 const AWAIT_GRACE_MS = 90000;
 let pollTimer = null;
+// What the server last said is still queued or with the judge. After Stop the
+// page keeps polling until this reaches zero, or for DRAIN_MAX_MS at most.
+let lastWaiting = null;
+const DRAIN_MAX_MS = 120000;
 
 function pruneAwaiting() {
   const cutoff = performance.now() - AWAIT_GRACE_MS;
@@ -962,6 +982,7 @@ async function poll() {
   // string "undefined" into the header, and res.terms.length then threw inside
   // the interval, where nothing reports it.
   if (typeof res?.known_count === "number") $("count").textContent = res.known_count;
+  if (typeof res?.waiting === "number") lastWaiting = res.waiting;
   pruneAwaiting();
   if (!Array.isArray(res?.terms) || !res.terms.length) return;
 

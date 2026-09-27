@@ -477,3 +477,33 @@ def test_the_header_mark_is_drawn_in_the_theme_colours(page, theme):
 def test_the_mark_is_decoration_for_screen_readers(page):
     assert page.get_attribute("h1 .logo", "aria-hidden") == "true"
     assert page.inner_text("h1").strip() == "Lecture Lens"
+
+
+# --- after Stop ------------------------------------------------------------------
+
+def test_after_stop_the_page_waits_for_the_judge_not_a_fixed_ten_seconds(page):
+    """
+    The judge can sit out a 25-second rate limit. The page used to collect
+    for ten seconds after Stop and give up, so the last terms of a lecture
+    never reached the glossary. Here the server holds the last verdict back
+    for about fourteen seconds, still reporting it as waiting.
+    """
+    calls = {"n": 0}
+
+    def updates(route):
+        calls["n"] += 1
+        if calls["n"] < 10:
+            body = '{"terms": [], "waiting": 1, "known_count": 15, "keyterms": []}'
+        else:
+            body = ('{"terms": [{"term": "malloc", "definition": "allocates memory", "note": ""}],'
+                    ' "waiting": 0, "known_count": 15, "keyterms": []}')
+        route.fulfill(status=200, content_type="application/json", body=body)
+
+    page.route("**/api/updates*", updates)
+    page.evaluate("running = true; pollTimer = setInterval(poll, 1500); stop();")
+
+    page.wait_for_selector("#glossary .card", timeout=30000)
+    assert page.locator("#glossary .card summary").inner_text() == "malloc"
+    page.wait_for_function("pollTimer === null", timeout=10000)
+    page.click("#log-toggle")
+    assert "all definitions are in" in page.inner_text("#log")

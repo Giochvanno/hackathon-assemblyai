@@ -8,7 +8,11 @@ know — while the lecturer is still talking.**
 
 Built on AssemblyAI for the Voice Agent Hackathon, September 2026.
 
-<!-- screenshot: docs/screenshot.png -->
+> **At a glance** · 18 of 24 terms caught on a live lecture · 80 of 114
+> candidate words turned away as ordinary or misheard · ~0.6 s from speech to
+> text · 160 tests, the key ones checked by putting the bug back
+
+![Lecture Lens during a lecture on memory in C: new terms highlighted with one-line definitions, today's glossary on the right, and the "I'm lost" explanation below](docs/screenshot.png)
 
 ---
 
@@ -29,6 +33,7 @@ You don't know which word you don't know until it is too late.
 | | |
 |---|---|
 | **Highlights what is new to this course** | Lecture Lens remembers every term the course has used. When the lecturer says one for the first time, it is highlighted in the transcript with a one-line definition. "New" means new *to this course* — not rare in English. |
+| **Keeps a glossary of today's terms** | Every new term also collects in a glossary beside the transcript — a sheet on a phone — so a definition can be looked up without hunting for the sentence it was said in. |
 | **Explains why you got lost** | The *I'm lost* button does not summarise — you heard the passage. It takes the terms that arrived in the last three minutes and explains the thread between them, and shows how dense that stretch was compared with the rest of the lecture. |
 | **Hears the course better over time** | The terms the course has settled on are sent back to AssemblyAI, so the words your lecturer uses most are the ones the model listens for. |
 
@@ -109,7 +114,7 @@ Speech to text, measured against the audio timeline (the comment in
 
 | | terminal client | browser |
 |---|---|---|
-| median | 262 ms | 380–620 ms |
+| median | 262 ms | 380–650 ms |
 | 95th percentile | 463 ms | — |
 
 From the word being said to its definition on screen: a few seconds, up to
@@ -181,21 +186,38 @@ Two, both fixed from its data:
   arrived a minute after the word. `ForceEndpoint` now closes a turn after ten;
   on the run we checked, the noise stayed at the same level.
 
+A rehearsal for the demo video found a third. Stop was followed by ten seconds
+of collecting definitions, but six terms were still with a judge sitting out a
+25-second rate limit — and because they had left the queue, the server
+reported nothing waiting. The end of the lecture never reached the glossary.
+Words with the judge now count as waiting, and after Stop the page collects
+until nothing is (two minutes at most).
+
 ---
 
 ## How we tested it
 
-### 114 automated tests
+### 160 automated tests
 
 ```
 python -m pytest
 ```
 
-Under a second, no network: the model is replaced by a stand-in that answers
-exactly as each test instructs. Most tests are named after a bug that actually
-shipped. Three of them are the same bug in three places — "judged and rejected"
-treated as "never judged", which silently lost terms — and that is why the
-suite exists.
+No network: the model is replaced by a stand-in that answers exactly as each
+test instructs.
+
+- **116 test the server**, in under a second. Most are named after a bug that
+  actually shipped. Three of them are the same bug in three places — "judged
+  and rejected" treated as "never judged", which silently lost terms — and that
+  is why the suite exists.
+- **44 drive the page in a real browser** (headless Chromium, against a real
+  local server). They check what the page does — the glossary, the log, the
+  status, a turn going all the way to the judge and back — and that the layout
+  holds when it fills up: sixty terms, a name longer than the sidebar, every
+  panel open, on six screen sizes and a phone, in both themes. Every text colour
+  is checked against its background for readability (WCAG AA). These need
+  Playwright (`python -m playwright install chromium`); without it they are
+  skipped.
 
 ### Testing the tests
 
@@ -210,6 +232,18 @@ the key fixes we put the bug back on purpose and checked that the suite fails:
 | a word glued to a dot loses its sentence | 1 |
 | the judge ignores the sentence it was given | 2 |
 | "not a C programming term" read as a definition | 5 |
+| a long term name spills out of its card | 6 |
+| the phone header squeezed into one row | 3 |
+| a long status message wraps under the buttons | 3 |
+| the glossary sheet on a phone never opens | 2 |
+| amber text on the light theme's white background | 1 |
+| the dark theme loses its monospace font | 1 |
+| after Stop, the page stops collecting definitions after ten seconds | 1 |
+| words still with the judge reported as "nothing waiting" | 1 |
+
+Writing the browser tests found real bugs before anyone saw them: the sidebar
+did not hide on phones, a long status pushed the header onto three lines, and
+the tab icon did not display at all (an unescaped `#` in its data URI).
 
 ### A real-speech test bench
 
@@ -301,7 +335,7 @@ src/
   debug_prompt.py     one prompt, its reply, and the parse
   check_gateway.py    which gateway models the key can reach
   candidates.py       transcript analysis from the first experiments
-web/index.html        the browser client
+web/index.html        the browser client, in one file
 seed/                 the course memory it starts with, and its declared terms
 data/                 the everyday-English word list
 tests/                the test suite
@@ -350,6 +384,9 @@ docs/                 the architecture diagram
 - **A ten-second turn can end mid-sentence.** The judge then sees half a
   sentence, and the paragraph break falls where the timer fell.
 - The first one to three seconds after *Start* are lost while the socket opens.
+- **Keep the tab visible.** When the browser window is covered by other windows,
+  Chrome slows the page down and the transcript falls seconds behind; it
+  catches up once the window is back on screen.
 
 **The app**
 
@@ -372,6 +409,13 @@ docs/                 the architecture diagram
   `src/bench_judge.py` says whether the new one is better.
 - **Choosing the course on the page**, and a memory per student instead of per
   server.
+- **Audio off the main thread**, in a worker, so a covered window cannot slow
+  the transcript down.
+
+## Author
+
+Built by **Arman**, a second-year student at Pusan National University —
+[github.com/Giochvanno](https://github.com/Giochvanno).
 
 ## License
 
