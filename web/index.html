@@ -4,12 +4,44 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lecture Lens</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E %3Crect width='32' height='32' rx='7' fill='%2316181c'/%3E %3Ccircle cx='14' cy='14' r='8.5' fill='none' stroke='%23e6e9ee' stroke-width='2.4'/%3E %3Cline x1='20.2' y1='20.2' x2='26' y2='26' stroke='%23e6e9ee' stroke-width='3' stroke-linecap='round'/%3E %3Cline x1='9.5' y1='11' x2='18.5' y2='11' stroke='%238b939e' stroke-width='1.8' stroke-linecap='round'/%3E %3Cline x1='9.5' y1='14.5' x2='18.5' y2='14.5' stroke='%23ffc66d' stroke-width='2.6' stroke-linecap='round'/%3E %3Cline x1='9.5' y1='18' x2='16' y2='18' stroke='%238b939e' stroke-width='1.8' stroke-linecap='round'/%3E %3C/svg%3E">
+<script>
+  // Before anything is drawn, so a light-theme reader never sees a dark flash.
+  // Their own choice wins; otherwise the system's.
+  (() => {
+    let t = null;
+    try { t = localStorage.getItem("lens-theme"); } catch {}
+    if (t !== "light" && t !== "dark") {
+      t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
 <style>
   :root {
     --bg: #16181c; --panel: #1e2126; --line: #2c3037;
-    --ink: #e6e9ee; --dim: #8b939e;
+    --ink: #e6e9ee; --dim: #8b939e; --soft: #c9ced6;
     --new: #ffc66d; --known: #6dd3c3;
+    --live: #3fb950; --err: #ff7b72; --idle: #5a626d;
+    --log-bg: #101216; --chip-bg: #16181c;
+    --lost-bg: #2a2231; --lost-bg-hover: #33283b; --lost-line: #6b5578;
+    --lost-ink: #e6d6f0; --lost-accent: #cdb4db;
+    --shade: rgba(0, 0, 0, .45); --flash: #ffc66d;
     --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    color-scheme: dark;
+  }
+  /* The same page in daylight. Amber and teal are darkened until they read on
+     white: the light-theme test checks every text colour against the page. */
+  :root[data-theme="light"] {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #dde1e6;
+    --ink: #1f2328; --dim: #57606a; --soft: #3a4149;
+    --new: #9a5b00; --known: #0b7a6c;
+    --live: #1a7f37; --err: #c4302b; --idle: #8c959f;
+    --log-bg: #eef1f4; --chip-bg: #f6f7f9;
+    --lost-bg: #f4edf9; --lost-bg-hover: #ece0f5; --lost-line: #a88bc0;
+    --lost-ink: #4f2f6b; --lost-accent: #6e4591;
+    --shade: rgba(20, 24, 30, .35); --flash: #ffe2a8;
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
   body {
@@ -25,10 +57,19 @@
     display: flex; align-items: center; gap: 12px;
     padding: 12px 20px; border-bottom: 1px solid var(--line);
   }
-  h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; flex: none; }
+  h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; flex: none;
+       display: inline-flex; align-items: center; gap: 8px; }
+  /* The mark: a lens over three lines of a lecture, the middle one — the new
+     term — in the highlight colour. Drawn in the theme's own colours. */
+  .logo { width: 24px; height: 24px; flex: none; fill: none; stroke-linecap: round; }
+  .logo circle { stroke: var(--ink); stroke-width: 2.4; }
+  .logo .handle { stroke: var(--ink); stroke-width: 3; }
+  .logo .l { stroke: var(--dim); stroke-width: 1.8; }
+  .logo .hi { stroke: var(--new); stroke-width: 2.6; }
   header button { flex: none; white-space: nowrap; }
   .actions { display: flex; gap: 10px; flex: none; }
   .phone-only { display: none; }
+  #theme { flex: none; font-size: 15px; line-height: 1; padding: 6px 9px; }
 
   /* One dot says what the page is doing; the words beside it say why. */
   /* Status messages run long ("could not connect — press Start to try
@@ -36,11 +77,11 @@
   .state { display: inline-flex; align-items: center; gap: 7px; min-width: 0;
            font-family: var(--mono); font-size: 12px; color: var(--dim); }
   #status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .state i { width: 8px; height: 8px; border-radius: 50%; background: #5a626d; flex: none; }
-  .state[data-state="live"] i { background: #3fb950; animation: pulse 1.6s ease-in-out infinite; }
+  .state i { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
+  .state[data-state="live"] i { background: var(--live); animation: pulse 1.6s ease-in-out infinite; }
   .state[data-state="live"] { color: var(--ink); }
   .state[data-state="warn"] i { background: var(--new); }
-  .state[data-state="err"] i { background: #ff7b72; }
+  .state[data-state="err"] i { background: var(--err); }
   @keyframes pulse { 50% { opacity: .35; } }
   .spacer { flex: 1; }
 
@@ -83,7 +124,7 @@
     border-radius: 0 5px 5px 0; transition: opacity .8s;
   }
   .gloss b { color: var(--new); font-family: var(--mono); font-size: 13px; flex: none; max-width: 40%; overflow-wrap: anywhere; }
-  .gloss span { color: #c9ced6; }
+  .gloss span { color: var(--soft); }
   .gloss.fade { opacity: .6; }
 
   .term { color: var(--known); }
@@ -127,12 +168,12 @@
     transition: transform .15s; font-family: system-ui, sans-serif;
   }
   .card[open] summary::after { transform: rotate(90deg); }
-  .card p { margin: 0; padding: 0 10px 10px; font-size: 13.5px; line-height: 1.55; color: #c9ced6;
+  .card p { margin: 0; padding: 0 10px 10px; font-size: 13.5px; line-height: 1.55; color: var(--soft);
             overflow-wrap: anywhere; }
   .card p.none { color: var(--dim); font-style: italic; }
   .card.just-added { animation: land .8s ease-out; }
   @keyframes land {
-    from { background: var(--new); transform: translateX(10px); }
+    from { background: var(--flash); transform: translateX(10px); }
   }
 
   #known-box summary { cursor: pointer; list-style: none; }
@@ -151,29 +192,29 @@
          padding: 6px 20px; border-top: 1px solid var(--line); }
   #bar .metric { font-size: 11.5px; white-space: nowrap; }
   #bar button { white-space: nowrap; }
-  button.quiet.alert { color: #ff7b72; }
+  button.quiet.alert { color: var(--err); }
   /* A visible trace of every step. Faults here are invisible otherwise:
      the socket just closes and the page looks idle. flex:none keeps it from
      being squeezed to nothing when the transcript grows. */
   #log {
-    flex: none; border-top: 1px solid var(--line); background: #101216;
+    flex: none; border-top: 1px solid var(--line); background: var(--log-bg);
     font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
     height: 150px; overflow-y: auto; padding: 8px 20px;
   }
   #log[hidden] { display: none; }
   #log div { display: flex; gap: 10px; white-space: pre-wrap; }
-  #log .t { color: #5a626d; flex: none; }
+  #log .t { color: var(--idle); flex: none; }
   #log .ok   { color: var(--known); }
   #log .warn { color: var(--new); }
-  #log .err  { color: #ff7b72; }
+  #log .err  { color: var(--err); }
 
   /* --- "I'm lost" ---------------------------------------------------------
      A panel, not a dialog. A dialog would take the lecture away from the
      student for as long as it is open, and the lecturer does not stop. */
   button.lost {
-    border-color: #6b5578; background: #2a2231; color: #e6d6f0; font-weight: 600;
+    border-color: var(--lost-line); background: var(--lost-bg); color: var(--lost-ink); font-weight: 600;
   }
-  button.lost:hover { border-color: #cdb4db; background: #33283b; }
+  button.lost:hover { border-color: var(--lost-accent); background: var(--lost-bg-hover); }
   button.lost.busy { opacity: .6; cursor: progress; }
 
   #why {
@@ -188,14 +229,14 @@
   #why header { padding: 0; border: 0; gap: 10px; }
   #why h2 {
     font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
-    color: #cdb4db; margin: 0; font-weight: 500;
+    color: var(--lost-accent); margin: 0; font-weight: 500;
   }
   #why-rate { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
   #why-text { font-size: 15px; line-height: 1.65; margin: 0; }
   #why-terms { display: flex; flex-wrap: wrap; gap: 6px; }
   #why-terms .chip {
     font-family: var(--mono); font-size: 12px; padding: 3px 9px;
-    border-radius: 999px; background: #16181c; border: 1px solid var(--line);
+    border-radius: 999px; background: var(--chip-bg); border: 1px solid var(--line);
     color: var(--new);
   }
   #why .close {
@@ -211,6 +252,7 @@
        on a phone. */
     header { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
     header .spacer { display: none; }
+    #theme { margin-left: auto; }
     .actions { width: 100%; }
     .actions button { flex: 1 1 0; padding: 7px 6px; }
     .phone-only { display: revert; }
@@ -224,10 +266,10 @@
       display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
       height: 72vh; border-left: 0; border-top: 1px solid var(--line);
       border-radius: 14px 14px 0 0; background: var(--bg);
-      box-shadow: 0 -12px 30px rgba(0, 0, 0, .45);
+      box-shadow: 0 -12px 30px var(--shade);
     }
     body.sheet-open aside { display: flex; animation: rise .2s ease-out; }
-    #sheet-bg { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .45); }
+    #sheet-bg { display: none; position: fixed; inset: 0; z-index: 10; background: var(--shade); }
     body.sheet-open #sheet-bg { display: block; }
     .sheet-head { display: flex; align-items: center; justify-content: space-between;
                   font-weight: 600; font-size: 15px; }
@@ -239,9 +281,16 @@
 <body>
   <main>
     <header>
-      <h1>Lecture Lens</h1>
+      <h1><svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="14" cy="14" r="8.5"/>
+          <line class="handle" x1="20.2" y1="20.2" x2="26" y2="26"/>
+          <line class="l" x1="9.5" y1="11" x2="18.5" y2="11"/>
+          <line class="hi" x1="9.5" y1="14.5" x2="18.5" y2="14.5"/>
+          <line class="l" x1="9.5" y1="18" x2="16" y2="18"/>
+        </svg>Lecture Lens</h1>
       <span id="state" class="state" data-state="idle"><i></i><span id="status">idle</span></span>
       <span class="spacer"></span>
+      <button id="theme" class="quiet" title="Light theme" aria-label="Switch theme">☀</button>
       <div class="actions">
         <button id="gloss-btn" class="phone-only" title="Open the glossary">Glossary <span id="gloss-n" class="count">0</span></button>
         <button id="lost" class="lost" title="Explain why this got hard to follow">I'm lost</button>
@@ -1048,6 +1097,20 @@ $("gloss-btn").onclick = () => sheet(!document.body.classList.contains("sheet-op
 $("gloss-close").onclick = () => sheet(false);
 $("sheet-bg").onclick = () => sheet(false);
 document.addEventListener("keydown", e => { if (e.key === "Escape") sheet(false); });
+
+// Dark for a lecture hall, light for a sunny library. Remembered per browser.
+function showTheme() {
+  const light = document.documentElement.dataset.theme === "light";
+  $("theme").textContent = light ? "☾" : "☀";
+  $("theme").title = light ? "Dark theme" : "Light theme";
+}
+$("theme").onclick = () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("lens-theme", next); } catch {}
+  showTheme();
+};
+showTheme();
 
 $("log-toggle").onclick = () => {
   const log = $("log");

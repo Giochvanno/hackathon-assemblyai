@@ -373,3 +373,107 @@ def test_on_a_phone_all_three_buttons_fit_before_and_during_a_lecture(page):
 def test_the_settled_terms_are_explained(page):
     page.click("#known-box summary")
     assert "heard at least twice" in page.inner_text("#known-box")
+
+
+# --- light and dark -----------------------------------------------------------
+
+def _lum(hex_):
+    h = hex_.strip().lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b)]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def _contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _var(pg, name):
+    return pg.evaluate("n => getComputedStyle(document.documentElement).getPropertyValue(n)", name)
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_every_text_colour_reads_on_its_background(page, theme):
+    """WCAG AA: 4.5 to 1 for text. Amber on white is where this fails first."""
+    page.evaluate("t => document.documentElement.dataset.theme = t", theme)
+    pairs = [(fg, bg) for fg in ("--ink", "--dim", "--soft", "--new", "--known", "--err")
+             for bg in ("--bg", "--panel")]
+    pairs.append(("--lost-ink", "--lost-bg"))
+    low = [(fg, bg, round(_contrast(_var(page, fg), _var(page, bg)), 2)) for fg, bg in pairs
+           if _contrast(_var(page, fg), _var(page, bg)) < 4.5]
+    assert low == [], f"too faint in the {theme} theme: {low}"
+
+
+def test_the_theme_switches_and_is_remembered(page):
+    start = page.evaluate("document.documentElement.dataset.theme")
+    before = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    page.click("#theme")
+    after = page.evaluate("document.documentElement.dataset.theme")
+    assert after != start
+    assert page.evaluate("getComputedStyle(document.body).backgroundColor") != before
+    page.reload()
+    assert page.evaluate("document.documentElement.dataset.theme") == after, "chosen once, kept"
+
+
+@pytest.mark.parametrize("system", ["light", "dark"])
+def test_a_first_visit_follows_the_system_theme(browser, base_url, system):
+    ctx = browser.new_context(color_scheme=system)
+    pg = ctx.new_page()
+    pg.goto(base_url)
+    assert pg.evaluate("document.documentElement.dataset.theme") == system
+    ctx.close()
+
+
+def test_on_a_phone_the_theme_button_sits_on_the_first_row(page):
+    page.set_viewport_size({"width": 390, "height": 844})
+    t, title = box(page, "#theme"), box(page, "h1")
+    assert t["right"] <= 390 and abs(t["y"] - title["y"]) < 20
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_a_theme_changes_colours_and_nothing_else(page, theme):
+    """
+    Caught for real: moving colours into a light block carried the font
+    variable with it, and the dark theme silently lost its monospace.
+    """
+    page.evaluate("t => document.documentElement.dataset.theme = t", theme)
+    assert "monospace" in page.eval_on_selector(".metric", "e => getComputedStyle(e).fontFamily")
+    assert "monospace" in page.eval_on_selector("#status", "e => getComputedStyle(e).fontFamily")
+    for name in ("--bg", "--panel", "--line", "--ink", "--dim", "--soft", "--new", "--known",
+                 "--live", "--err", "--idle", "--log-bg", "--chip-bg", "--lost-bg",
+                 "--lost-ink", "--lost-accent", "--shade", "--flash", "--mono"):
+        assert _var(page, name).strip(), f"{name} is not defined in the {theme} theme"
+
+
+# --- the mark -------------------------------------------------------------------
+
+def test_the_tab_has_an_icon(page):
+    href = page.get_attribute("link[rel='icon']", "href")
+    assert href.startswith("data:image/svg+xml,")
+    # It must be a picture the browser can actually draw, not just a string.
+    ok = page.evaluate("""href => new Promise(done => {
+        const img = new Image();
+        img.onload = () => done(img.naturalWidth > 0);
+        img.onerror = () => done(false);
+        img.src = href;
+    })""", href)
+    assert ok, "the favicon does not decode"
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_the_header_mark_is_drawn_in_the_theme_colours(page, theme):
+    page.evaluate("t => document.documentElement.dataset.theme = t", theme)
+    logo = box(page, "h1 .logo")
+    assert 20 <= logo["w"] <= 28 and 20 <= logo["h"] <= 28
+    lens = page.eval_on_selector("h1 .logo circle", "e => getComputedStyle(e).stroke")
+    bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    assert lens != bg, "the lens would vanish into the page"
+    hi = page.eval_on_selector("h1 .logo .hi", "e => getComputedStyle(e).stroke")
+    assert hi == page.eval_on_selector(".empty b", "e => getComputedStyle(e).color"), \
+        "the highlighted line uses the same colour as a highlighted term"
+
+
+def test_the_mark_is_decoration_for_screen_readers(page):
+    assert page.get_attribute("h1 .logo", "aria-hidden") == "true"
+    assert page.inner_text("h1").strip() == "Lecture Lens"
