@@ -43,6 +43,8 @@ You don't know which word you don't know until it is too late.
 Definitions are one line on purpose: anything longer costs the student the next
 thirty seconds of the lecture, which is what the tool is supposed to save.
 
+Why it doesn't talk back: it runs in a lecture hall. A voice agent that speaks over the lecturer would cost the student exactly the sentences it is meant to save.
+
 ---
 
 ## How it works
