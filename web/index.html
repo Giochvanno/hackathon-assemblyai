@@ -15,9 +15,8 @@
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font: 15px/1.7 system-ui, sans-serif;
-    display: grid; grid-template-columns: 1fr 280px; height: 100vh;
+    display: grid; grid-template-columns: 1fr 330px; height: 100vh;
   }
-  @media (max-width: 720px) { body { grid-template-columns: 1fr; } aside { display: none; } }
 
   /* min-height:0 on both: a grid item and a flex item both refuse to shrink
      below their content by default, which pushes the panel below the fold. */
@@ -26,7 +25,23 @@
     display: flex; align-items: center; gap: 12px;
     padding: 12px 20px; border-bottom: 1px solid var(--line);
   }
-  h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; flex: none; }
+  header button { flex: none; white-space: nowrap; }
+  .actions { display: flex; gap: 10px; flex: none; }
+  .phone-only { display: none; }
+
+  /* One dot says what the page is doing; the words beside it say why. */
+  /* Status messages run long ("could not connect — press Start to try
+     again"). They shrink and trail off; the buttons beside them never move. */
+  .state { display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+           font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  #status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .state i { width: 8px; height: 8px; border-radius: 50%; background: #5a626d; flex: none; }
+  .state[data-state="live"] i { background: #3fb950; animation: pulse 1.6s ease-in-out infinite; }
+  .state[data-state="live"] { color: var(--ink); }
+  .state[data-state="warn"] i { background: var(--new); }
+  .state[data-state="err"] i { background: #ff7b72; }
+  @keyframes pulse { 50% { opacity: .35; } }
   .spacer { flex: 1; }
 
   button {
@@ -41,11 +56,21 @@
   .metric { font-family: var(--mono); font-size: 12px; color: var(--dim); }
   .metric b { color: var(--ink); font-weight: 500; }
 
+  /* The transcript keeps at least a few lines even with the "I'm lost"
+     panel and the log both open; those two give way first. */
   #transcript {
-    flex: 1 1 0; min-height: 0; overflow-y: auto;
-    padding: 24px 20px; font-size: 17px;
+    flex: 1 1 0; min-height: 140px; overflow-y: auto;
+    padding: 28px 24px; font-size: 17px;
     display: flex; flex-direction: column; gap: 14px;
   }
+  /* Lines the width of a monitor are hard to follow back to their start. */
+  #transcript > * { width: 100%; max-width: 780px; margin-inline: auto; }
+
+  .empty { margin-top: 10vh; color: var(--dim); font-size: 15px; line-height: 1.7; }
+  .empty h2 { color: var(--ink); font-size: 20px; font-weight: 600; margin: 0 0 12px; }
+  .empty ol { margin: 12px 0 0; padding-left: 20px; }
+  .empty li { margin: 4px 0; }
+  .empty b { color: var(--new); font-weight: 600; }
   .turn { transition: opacity .4s; }
   .turn.partial { color: var(--dim); }
   /* the one visual beat: everything recedes, the unknown word does not */
@@ -57,9 +82,9 @@
     border-left: 2px solid var(--new); background: var(--panel);
     border-radius: 0 5px 5px 0; transition: opacity .8s;
   }
-  .gloss b { color: var(--new); font-family: var(--mono); font-size: 13px; }
-  .gloss span { color: var(--dim); }
-  .gloss.fade { opacity: .35; }
+  .gloss b { color: var(--new); font-family: var(--mono); font-size: 13px; flex: none; max-width: 40%; overflow-wrap: anywhere; }
+  .gloss span { color: #c9ced6; }
+  .gloss.fade { opacity: .6; }
 
   .term { color: var(--known); }
   .term.fresh {
@@ -68,35 +93,74 @@
   }
 
   aside {
-    border-left: 1px solid var(--line); padding: 16px;
-    display: flex; flex-direction: column; gap: 10px; overflow-y: auto;
+    min-width: 0; border-left: 1px solid var(--line); padding: 18px 16px;
+    display: flex; flex-direction: column; gap: 18px; overflow-y: auto;
   }
   aside h2 {
     font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
     color: var(--dim); margin: 0; font-weight: 500;
+    display: flex; align-items: center; gap: 8px;
   }
-  #glossary { display: flex; flex-direction: column; gap: 4px; }
-  .entry {
-    font-family: var(--mono); font-size: 12px; padding: 4px 8px;
-    border-radius: 4px; background: var(--panel);
-    display: flex; justify-content: space-between; gap: 8px;
-  }
-  .entry.just-added { animation: land .6s ease-out; }
-  @keyframes land {
-    from { background: var(--new); color: #16181c; transform: translateX(10px); }
-  }
-  .entry span:last-child { color: var(--dim); }
+  .count { font-family: var(--mono); font-size: 11px; letter-spacing: 0;
+           padding: 0 7px; border-radius: 999px; background: var(--panel); color: var(--ink); }
+  .side-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .hint { color: var(--dim); font-size: 13px; line-height: 1.55; margin: 0; }
+  .hint.small { font-size: 12px; margin-top: 8px; }
+  button.quiet { border: 0; background: none; color: var(--dim); padding: 2px 4px; font-size: 12px; }
+  button.quiet:hover { color: var(--ink); }
 
-  #status { flex: none; padding: 8px 20px; border-top: 1px solid var(--line);
-            font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  /* The glossary is where a student looks up a term without hunting through
+     the transcript for the sentence it was defined in. One card per term, the
+     newest on top, closed until asked for. */
+  #glossary { display: flex; flex-direction: column; gap: 6px; }
+  .card { background: var(--panel); border-radius: 6px; border: 1px solid transparent; }
+  .card[open] { border-color: var(--line); }
+  .card summary {
+    list-style: none; cursor: pointer; padding: 7px 10px;
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 13px; color: var(--new);
+    overflow-wrap: anywhere;
+  }
+  .card summary::-webkit-details-marker { display: none; }
+  .card summary::after {
+    content: "›"; margin-left: auto; color: var(--dim);
+    transition: transform .15s; font-family: system-ui, sans-serif;
+  }
+  .card[open] summary::after { transform: rotate(90deg); }
+  .card p { margin: 0; padding: 0 10px 10px; font-size: 13.5px; line-height: 1.55; color: #c9ced6;
+            overflow-wrap: anywhere; }
+  .card p.none { color: var(--dim); font-style: italic; }
+  .card.just-added { animation: land .8s ease-out; }
+  @keyframes land {
+    from { background: var(--new); transform: translateX(10px); }
+  }
+
+  #known-box summary { cursor: pointer; list-style: none; }
+  #known-box summary::-webkit-details-marker { display: none; }
+  #known-box summary h2::after { content: "›"; margin-left: 2px; font-family: system-ui, sans-serif; }
+  #known-box[open] summary h2::after { content: "⌄"; }
+  #known-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  #known-list span {
+    font-family: var(--mono); font-size: 12px; padding: 2px 8px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--known);
+    overflow-wrap: anywhere;
+  }
+
+  /* Numbers for us, not for the student: small, grey, out of the way. */
+  #bar { flex: none; display: flex; align-items: center; gap: 16px;
+         padding: 6px 20px; border-top: 1px solid var(--line); }
+  #bar .metric { font-size: 11.5px; white-space: nowrap; }
+  #bar button { white-space: nowrap; }
+  button.quiet.alert { color: #ff7b72; }
   /* A visible trace of every step. Faults here are invisible otherwise:
      the socket just closes and the page looks idle. flex:none keeps it from
      being squeezed to nothing when the transcript grows. */
   #log {
     flex: none; border-top: 1px solid var(--line); background: #101216;
     font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-    height: 180px; overflow-y: auto; padding: 8px 20px;
+    height: 150px; overflow-y: auto; padding: 8px 20px;
   }
+  #log[hidden] { display: none; }
   #log div { display: flex; gap: 10px; white-space: pre-wrap; }
   #log .t { color: #5a626d; flex: none; }
   #log .ok   { color: var(--known); }
@@ -106,14 +170,16 @@
   /* --- "I'm lost" ---------------------------------------------------------
      A panel, not a dialog. A dialog would take the lecture away from the
      student for as long as it is open, and the lecturer does not stop. */
-  button.lost { border-color: #4a3f52; color: #cdb4db; }
-  button.lost:hover { border-color: #cdb4db; }
+  button.lost {
+    border-color: #6b5578; background: #2a2231; color: #e6d6f0; font-weight: 600;
+  }
+  button.lost:hover { border-color: #cdb4db; background: #33283b; }
   button.lost.busy { opacity: .6; cursor: progress; }
 
   #why {
-    flex: none; display: none; gap: 12px; flex-direction: column;
+    flex: 0 1 auto; min-height: 0; display: none; gap: 12px; flex-direction: column;
     border-top: 1px solid var(--line); background: var(--panel);
-    padding: 14px 20px; max-height: 40vh; overflow-y: auto;
+    padding: 14px 20px; max-height: 38vh; overflow-y: auto;
     animation: rise .25s ease-out;
   }
   #why.open { display: flex; }
@@ -135,6 +201,38 @@
   #why .close {
     border: 0; background: none; color: var(--dim); padding: 0 4px; font-size: 18px;
   }
+  /* Last, so it wins over the rules above. A phone has no room for the
+     sidebar; the definitions still appear under each sentence. */
+  @media (max-width: 720px) {
+    body { grid-template-columns: 1fr; }
+    .wide-only { display: none; }
+    /* Two rows: the name and the status, then the three buttons side by
+       side. One row does not fit "Glossary", "I'm lost" and "Start listening"
+       on a phone. */
+    header { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
+    header .spacer { display: none; }
+    .actions { width: 100%; }
+    .actions button { flex: 1 1 0; padding: 7px 6px; }
+    .phone-only { display: revert; }
+    #gloss-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+    #transcript { padding: 20px 14px; }
+    #bar { padding: 6px 14px; }
+
+    /* The glossary becomes a sheet over the bottom of the screen: closed
+       until asked for, and the lecture keeps running underneath it. */
+    aside {
+      display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+      height: 72vh; border-left: 0; border-top: 1px solid var(--line);
+      border-radius: 14px 14px 0 0; background: var(--bg);
+      box-shadow: 0 -12px 30px rgba(0, 0, 0, .45);
+    }
+    body.sheet-open aside { display: flex; animation: rise .2s ease-out; }
+    #sheet-bg { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .45); }
+    body.sheet-open #sheet-bg { display: block; }
+    .sheet-head { display: flex; align-items: center; justify-content: space-between;
+                  font-weight: 600; font-size: 15px; }
+    .sheet-head button { font-size: 22px; line-height: 1; padding: 0 6px; }
+  }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -142,14 +240,26 @@
   <main>
     <header>
       <h1>Lecture Lens</h1>
-      <span class="metric">course <b id="course">c-programming</b></span>
+      <span id="state" class="state" data-state="idle"><i></i><span id="status">idle</span></span>
       <span class="spacer"></span>
-      <span class="metric">latency <b id="lat">—</b></span>
-      <span class="metric">known <b id="count">0</b></span>
-      <button id="lost" class="lost" title="Explain why this got hard to follow">I'm lost</button>
-      <button id="go">Start listening</button>
+      <div class="actions">
+        <button id="gloss-btn" class="phone-only" title="Open the glossary">Glossary <span id="gloss-n" class="count">0</span></button>
+        <button id="lost" class="lost" title="Explain why this got hard to follow">I'm lost</button>
+        <button id="go">Start listening</button>
+      </div>
     </header>
-    <div id="transcript"></div>
+    <div id="transcript">
+      <div id="empty" class="empty">
+        <h2>Follow a lecture without losing the thread.</h2>
+        Press <b>Start listening</b> and let the lecture play.
+        <ol>
+          <li>The transcript appears here as the lecturer speaks.</li>
+          <li>A term this course has not used before is <b>highlighted</b>, with a one-line definition under it.</li>
+          <li class="wide-only">Every new term also collects on the right, so you can look it up without searching the text.</li>
+          <li>Lost the thread? Press <b>I'm lost</b>: it explains how the last few terms fit together.</li>
+        </ol>
+      </div>
+    </div>
     <section id="why">
       <header>
         <h2>Why this got hard</h2>
@@ -160,12 +270,33 @@
       <div id="why-terms"></div>
       <p id="why-text"></p>
     </section>
-    <div id="status">idle</div>
-    <div id="log"></div>
+    <div id="bar">
+      <span class="metric">latency <b id="lat">—</b></span>
+      <span class="metric wide-only">terms in course memory <b id="count">0</b></span>
+      <span class="spacer"></span>
+      <button id="log-toggle" class="quiet" title="Diagnostics">show log</button>
+    </div>
+    <div id="log" hidden></div>
   </main>
-  <aside>
-    <h2>Course glossary</h2>
-    <div id="glossary"></div>
+  <div id="sheet-bg" class="phone-only"></div>
+  <aside id="sheet">
+    <div class="sheet-head phone-only">
+      <span>Glossary</span>
+      <button id="gloss-close" class="quiet" title="Close">&times;</button>
+    </div>
+    <section>
+      <div class="side-head">
+        <h2>New in this lecture <span id="new-count" class="count">0</span></h2>
+        <button id="expand" class="quiet" title="Open or close every definition">open all</button>
+      </div>
+      <p id="new-empty" class="hint">Terms the lecturer introduces collect here. Click one to see its definition.</p>
+      <div id="glossary"></div>
+    </section>
+    <details id="known-box">
+      <summary><h2>Known from earlier <span id="known-count" class="count">0</span></h2></summary>
+      <p class="hint small">Terms this course has settled on — heard at least twice. They also help AssemblyAI hear the lecture.</p>
+      <div id="known-list"></div>
+    </details>
   </aside>
 
 <script>
@@ -202,7 +333,14 @@ const FRAME_MS = 50;
 
 const $ = id => document.getElementById(id);
 const transcript = $("transcript");
-const say = m => $("status").textContent = m;
+// The dot follows the words: green only while audio is actually flowing.
+function say(m) {
+  $("status").textContent = m;
+  $("state").dataset.state =
+    /^listening/.test(m) ? "live" :
+    /reconnect|disconnected/.test(m) ? "warn" :
+    /error|could not/.test(m) ? "err" : "idle";
+}
 
 const t0 = performance.now();
 const LOG_LINES = 300;          // what fits a problem, not a lecture
@@ -226,6 +364,8 @@ function log(msg, kind = "") {
   body.textContent = msg;
   row.append(at, body);
   $("log").append(row);
+  // The log is hidden by default; an error should still be noticed.
+  if (kind === "err" && $("log").hidden) $("log-toggle").classList.add("alert");
   // Fifty minutes of diagnostics is tens of thousands of nodes, and each new
   // line reads scrollHeight, which forces a layout of the whole column.
   const panel = $("log");
@@ -332,6 +472,7 @@ let pending16 = new Int16Array(0);
 const FRAME_SAMPLES = (TARGET_RATE * FRAME_MS) / 1000;   // 800
 
 async function start() {
+  $("empty")?.remove();
   $("log").replaceChildren();
   log(`page on ${location.protocol}//${location.host}`);
   log(`secure context: ${window.isSecureContext} (microphone needs true)`);
@@ -854,17 +995,69 @@ function showGloss(turnEl, term, definition) {
   setTimeout(() => gloss.classList.add("fade"), 6000);
 }
 
+// "open all" is a mode, not a one-off: while it is on, cards that arrive
+// later open too, so the label never lies about what the list is doing.
+let allOpen = false;
+
+// Two lists. "New in this lecture" holds a card per term met today, with its
+// definition, so a student can look one up without hunting for the sentence.
+// "Known from earlier" is what the course already knew when the session
+// opened: names only, folded away.
 function addEntry(term, definition, fresh) {
   const key = term.toLowerCase();
   if (known.has(key)) return;
   known.add(key);
-  const row = document.createElement("div");
-  row.className = "entry" + (fresh ? " just-added" : "");
-  row.title = definition || "";
-  row.innerHTML = `<span></span><span>${fresh ? "new" : ""}</span>`;
-  row.firstChild.textContent = term;
-  $("glossary").prepend(row);
+
+  if (!fresh) {
+    const chip = document.createElement("span");
+    chip.textContent = term;
+    $("known-list").append(chip);
+    $("known-count").textContent = $("known-list").childElementCount;
+    return;
+  }
+
+  const card = document.createElement("details");
+  card.className = "card just-added";
+  const name = document.createElement("summary");
+  name.textContent = term;
+  const text = document.createElement("p");
+  if (definition) {
+    text.textContent = definition;
+  } else {
+    text.textContent = "No definition yet — the judge could not be reached.";
+    text.className = "none";
+  }
+  card.append(name, text);
+  card.open = allOpen;
+  $("glossary").prepend(card);
+  $("new-empty").hidden = true;
+  $("new-count").textContent = $("glossary").childElementCount;
+  $("gloss-n").textContent = $("glossary").childElementCount;
 }
+
+$("expand").onclick = () => {
+  allOpen = !allOpen;
+  document.querySelectorAll("#glossary .card").forEach(c => { c.open = allOpen; });
+  $("expand").textContent = allOpen ? "close all" : "open all";
+};
+
+// On a phone the glossary is a sheet: the button opens it, the cross, the
+// dimmed lecture behind it and Escape close it.
+const sheet = open => document.body.classList.toggle("sheet-open", open);
+$("gloss-btn").onclick = () => sheet(!document.body.classList.contains("sheet-open"));
+$("gloss-close").onclick = () => sheet(false);
+$("sheet-bg").onclick = () => sheet(false);
+document.addEventListener("keydown", e => { if (e.key === "Escape") sheet(false); });
+
+$("log-toggle").onclick = () => {
+  const log = $("log");
+  log.hidden = !log.hidden;
+  $("log-toggle").textContent = log.hidden ? "show log" : "hide log";
+  if (!log.hidden) {
+    $("log-toggle").classList.remove("alert");
+    log.scrollTop = log.scrollHeight;
+  }
+};
 
 /* ---------- "I'm lost" ------------------------------------------------------
    The button does not ask for a summary. The student heard the passage; what
@@ -941,7 +1134,13 @@ $("why-close").onclick = () => $("why").classList.remove("open");
 
 $("go").onclick = () => running
   ? stop()
-  : start().catch(e => { log(`start failed: ${e.name}: ${e.message}`, "err"); say("error — see log"); });
+  : start().catch(e => {
+      log(`start failed: ${e.name}: ${e.message}`, "err");
+      say("error — see log");
+      $("log").hidden = false;                 // the message says "see log"
+      $("log-toggle").textContent = "hide log";
+      $("log-toggle").classList.remove("alert");
+    });
 </script>
 </body>
 </html>
