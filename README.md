@@ -6,6 +6,9 @@ know — while the lecturer is still talking.**
 **Try it:** https://lecture-lens-vmam.onrender.com
 (free hosting sleeps after 15 minutes; the first visit takes about a minute to wake it)
 
+**Watch it (2:17):** https://youtu.be/zyPgEgv9SBc — a live take in my own voice,
+with captions; the waits are sped up and marked as such.
+
 Built on AssemblyAI for the Voice Agent Hackathon, September 2026.
 
 > **At a glance** · 18 of 24 terms caught on a live lecture · 80 of 114
