@@ -10,3 +10,7 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.11"
+      # One course shared by every visitor: start again from the seed after
+      # ten minutes without speech, so the next person meets the terms as new.
+      - key: DEMO_RESET_IDLE_MIN
+        value: "10"

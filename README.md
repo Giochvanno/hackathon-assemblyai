@@ -13,7 +13,7 @@ Built on AssemblyAI for the Voice Agent Hackathon, September 2026.
 
 > **At a glance** · 18 of 24 terms caught on a live lecture · 80 of 114
 > candidate words turned away as ordinary or misheard · ~0.6 s from speech to
-> text · 160 tests, the key ones checked by putting the bug back
+> text · 166 tests, the key ones checked by putting the bug back
 
 ![Lecture Lens during a lecture on memory in C: new terms highlighted with one-line definitions, today's glossary on the right, and the "I'm lost" explanation below](docs/screenshot.png)
 
@@ -202,7 +202,7 @@ until nothing is (two minutes at most).
 
 ## How we tested it
 
-### 160 automated tests
+### 166 automated tests
 
 ```
 python -m pytest
@@ -211,7 +211,7 @@ python -m pytest
 No network: the model is replaced by a stand-in that answers exactly as each
 test instructs.
 
-- **116 test the server**, in under a second. Most are named after a bug that
+- **122 test the server**, in under a second. Most are named after a bug that
   actually shipped. Three of them are the same bug in three places — "judged
   and rejected" treated as "never judged", which silently lost terms — and that
   is why the suite exists.
@@ -245,6 +245,9 @@ the key fixes we put the bug back on purpose and checked that the suite fails:
 | the dark theme loses its monospace font | 1 |
 | after Stop, the page stops collecting definitions after ten seconds | 1 |
 | words still with the judge reported as "nothing waiting" | 1 |
+| the shared demo keeps the last visitor's memory | 1 |
+| the demo reset also wipes a real course's semester | 1 |
+| the demo resets while words are still with the judge | 1 |
 
 Writing the browser tests found real bugs before anyone saw them: the sidebar
 did not hide on phones, a long status pushed the header onto three lines, and
@@ -402,7 +405,11 @@ docs/                 the architecture diagram
   browser, not a real network failure.
 - **Hosting:** on the free tier the disk is wiped on every restart — the seed is
   always there, anything learned since is not. One process, no login: anyone
-  with the URL writes to the course memory.
+  with the URL writes to the course memory. So that the next visitor still
+  meets the sample lecture's terms as new, the public demo starts again from
+  the seed after ten minutes without speech (`DEMO_RESET_IDLE_MIN=10` on the
+  host). It is off unless set: on a real course, forgetting the semester is
+  the bug.
 
 ## Next
 

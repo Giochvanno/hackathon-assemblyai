@@ -83,6 +83,23 @@ MAX_WINDOW_S = 1800.0
 # one call instead of each buying its own rate-limit penalty.
 FLUSH_INTERVAL_S = 2.0
 
+# The public demo is one course that every visitor shares. That is the design —
+# a course remembers what it has taught — but on a demo it means the second
+# person to read the sample lecture sees nothing highlighted, because the first
+# one already taught the course those words. So a demo can ask for the course
+# to start again from its seed once nobody has spoken for this many minutes.
+# Off unless set: on a real course, forgetting the semester is the bug.
+DEMO_RESET_IDLE_S = float(os.environ.get("DEMO_RESET_IDLE_MIN") or 0) * 60
+
+
+def _now() -> float:
+    # One name to replace in tests, instead of the clock of the whole process.
+    return time.monotonic()
+
+
+# When each course last heard speech (or a Start), for the demo reset above.
+_last_heard: dict[str, float] = {}
+
 # One glossary and one judge per course, kept in memory, written through to disk.
 _courses: dict[str, CourseGlossary] = {}
 _judges: dict[str, TermJudge] = {}
@@ -150,6 +167,40 @@ def glossary_for(name: str) -> CourseGlossary:
         if name not in _courses:
             _courses[name] = CourseGlossary(name, directory=str(DATA_DIR))
         return _courses[name]
+
+
+def reset_if_idle(name: str) -> None:
+    """
+    On a demo, put the course back to its seed if nobody has spoken for a while.
+
+    Called where a visitor shows up — the Start button and every finished turn —
+    and never from /api/updates or the page itself, so a monitor pinging the
+    site does not count as somebody listening. The verdict cache is kept: a
+    term the judge has defined before comes back at once, without a gateway
+    call. Nothing happens while words are still queued or with the judge.
+    """
+    if DEMO_RESET_IDLE_S <= 0:
+        return
+    now = _now()
+    with _lock:
+        last = _last_heard.get(name)
+        _last_heard[name] = now
+        if last is None or now - last < DEMO_RESET_IDLE_S:
+            return
+        if _pending.get(name) or _inflight.get(name):
+            return
+        seed = SEED_DIR / f"{name}.json"
+        if not seed.exists():
+            return
+        before = set(glossary_for(name).terms)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / seed.name).write_bytes(seed.read_bytes())
+        _courses[name] = CourseGlossary(name, directory=str(DATA_DIR))
+        _introduced.pop(name, None)
+        learned = len(before - set(_courses[name].terms))
+    # The trace a reset leaves: how much the last visitor taught the course.
+    print(f"[demo] {name}: back to the seed after {(now - last) / 60:.0f} min "
+          f"without speech; {learned} term(s) had been learned since", flush=True)
 
 
 def declared_for(name: str) -> frozenset[str]:
@@ -406,6 +457,7 @@ def observe(turn: TurnIn) -> dict:
     Nothing here touches the network, so the answer is as fast as the disk.
     """
     valid_course(turn.course)
+    reset_if_idle(turn.course)
     g = glossary_for(turn.course)
     j = judge_for(turn.course, turn.subject)
 
@@ -547,6 +599,7 @@ def im_lost(body: LostIn) -> dict:
 def keyterms(body: TermsIn) -> dict:
     """What the course already knows — sent to the socket as it opens."""
     valid_course(body.course)
+    reset_if_idle(body.course)
     g = glossary_for(body.course)
     return {"keyterms": g.keyterms(), "known_count": len(g.terms)}
 

@@ -476,3 +476,105 @@ def test_a_failed_judgement_is_not_left_counted_forever(srv, model):
         observe(c, "We call malloc here.")
         srv.flush("c")
     assert srv._inflight.get("c", 0) == 0
+
+
+# --- the public demo starts again after a quiet spell ------------------------
+
+SEED_C = ('{"course": "c", "terms": {"scanf": {"surface": "scanf", "count": 3, '
+          '"first_seen": "2026-09-10"}}}')
+
+
+@pytest.fixture
+def demo(srv, monkeypatch):
+    """A demo course with a seed, a ten-minute reset and a clock we move by hand."""
+    srv.SEED_DIR.mkdir(parents=True)
+    (srv.SEED_DIR / "c.json").write_text(SEED_C)
+    srv.plant_seed()
+    clock = [1000.0]
+    monkeypatch.setattr(srv, "_now", lambda: clock[0])
+    monkeypatch.setattr(srv, "DEMO_RESET_IDLE_S", 600.0)
+
+    def later(seconds):
+        clock[0] += seconds
+    return later
+
+
+def test_a_second_visitor_meets_the_terms_as_new(srv, model, demo):
+    """
+    The demo is one course for everybody. A judge who reads the sample lecture
+    after another one saw nothing highlighted: the first had already taught the
+    course every word in it.
+    """
+    model()
+    with client(srv) as c:
+        assert observe(c, "We call malloc here.")["pending"] == ["malloc"]
+        srv.flush("c")
+        demo(11 * 60)                                  # nobody speaks for 11 min
+        again = observe(c, "We call malloc here.")
+
+    assert "malloc" in again["new_terms"], "the next visitor got the last one's memory"
+    assert srv.glossary_for("c").is_new("scanf") is False, "the seed itself was lost"
+
+
+def test_a_short_pause_in_a_lecture_is_not_a_new_visitor(srv, model, demo):
+    model()
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        srv.flush("c")
+        demo(5 * 60)
+        again = observe(c, "We call malloc here.")
+
+    assert again["new_terms"] == {} and again["pending"] == []
+
+
+def test_without_the_setting_a_course_never_forgets(srv, model, monkeypatch):
+    """Off by default: on a real course, losing the semester IS the bug."""
+    srv.SEED_DIR.mkdir(parents=True)
+    (srv.SEED_DIR / "c.json").write_text(SEED_C)
+    srv.plant_seed()
+    clock = [1000.0]
+    monkeypatch.setattr(srv, "_now", lambda: clock[0])
+    model()
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        srv.flush("c")
+        clock[0] += 30 * 24 * 3600                     # a month between lectures
+        again = observe(c, "We call malloc here.")
+
+    assert again["new_terms"] == {} and again["pending"] == []
+
+
+def test_the_start_button_after_a_quiet_spell_already_sees_the_seed(srv, model, demo):
+    model()
+    with client(srv) as c:
+        observe(c, "We call malloc here.")
+        srv.flush("c")
+        assert c.post("/api/keyterms", json={"course": "c"}).json()["known_count"] == 2
+        demo(11 * 60)
+        start = c.post("/api/keyterms", json={"course": "c"}).json()
+
+    assert start["known_count"] == 1
+
+
+def test_a_course_is_not_reset_while_words_are_still_being_judged(srv, model, demo):
+    model()
+    with client(srv) as c:
+        observe(c, "We call malloc here.")             # queued, not yet judged
+        demo(11 * 60)
+        observe(c, "And then free it.")
+
+    assert srv.glossary_for("c").is_new("malloc") is False
+
+
+def test_a_reset_leaves_a_trace_of_what_the_last_visitor_taught(srv, model, demo, capsys):
+    """The memory is gone after a reset; the log line is how you still know it was used."""
+    model()
+    with client(srv) as c:
+        observe(c, "We call malloc and realloc here.")
+        srv.flush("c")
+        demo(11 * 60)
+        observe(c, "Hello again.")
+
+    out = capsys.readouterr().out
+    assert "[demo] c: back to the seed after 11 min" in out
+    assert "2 term(s) had been learned since" in out
